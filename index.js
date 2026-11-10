@@ -26,9 +26,10 @@ import { spawn, spawnSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, redactCookie } from './lib/state.mjs'
+import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, windowDayKey, redactCookie } from './lib/state.mjs'
 import { saveCookie, readCookie, hasCredential, credentialInfo, clearCredential, cookiePath } from './lib/credential.mjs'
 import { sendWebhook, condense, maskUrl } from './lib/notify.mjs'
+import { whichInPath } from './lib/quiet.mjs'
 import { sendToast, toastSummary } from './lib/toast.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 import {
@@ -141,6 +142,116 @@ export const Config = !z ? undefined : z.object({
   chatWatch: z.boolean().default(true).extra('volatile', true),
   /** 盯梢间隔（秒），10–300，默认 30 */
   chatWatchSec: z.natural().default(30).extra('volatile', true),
+  /**
+   * ⭐⭐ 自动回「评论区 @ 我」（2026-10-25，使用者要求「让她自己能自动回复别人的艾特」）。
+   *
+   * 与 `commentAtMe` 是**相反方向**，别搞混：
+   *   · `commentAtMe` = 她**主动去**别人视频下 @ 使用者（推东西给主人）
+   *   · `atWatch`     = **别人 @ 她**，她自己在对方那条评论下回复对方
+   *
+   * 走 `tools/at-me-watch.mjs`（规则写死在脚本里，不靠模型临场发挥）：
+   *   只回**指定视频/全站**下 @ 她的；特殊称呼只给号主；每条 ≤100 字；
+   *   同一人同一楼最多 1 次；连续 10 分钟没人 @ 自己收工；撞 403 立刻停（越重试封越久）。
+   *
+   * ⚠️ 默认 **false** —— 这是**拿使用者账号对外说话**，得他自己点开。
+   */
+  atWatch: z.boolean().default(false).extra('volatile', true),
+  /** 多久查一次 @（秒），30–3600，默认 120（别太频，通知接口会限流） */
+  atWatchSec: z.natural().default(120).extra('volatile', true),
+  /** 每次最多回几条，1–20，默认 3 */
+  atWatchMax: z.natural().default(3).extra('volatile', true),
+  /**
+   * 只盯这一条视频下的 @；留空 = **全站盯**（任何视频下 @ 她的都算）。
+   * 填了就是限流/试水用。
+   */
+  atWatchAweme: z.string().default('').extra('volatile', true),
+  /**
+   * 号主的抖音 uid（数字）。不给就认不出「谁是主人」⇒
+   * 「特殊称呼只属于号主」那条边界会退化（对谁都不带称呼）。
+   */
+  ownerUid: z.string().default('').extra('volatile', true),
+  /**
+   * ⭐⭐ 自动回私信（2026-10-25，使用者原话「私聊已读不回呢」）。
+   *
+   * 与 `chatWatch` 的区别：`chatWatch` 只「看见 + 记录」；打开这个才会**真的回话**。
+   * 与 `atWatch` 的区别：那个盯评论区 @，这个盯私信。
+   *
+   * 走 `tools/dm-auto-reply.mjs`（规则写死在脚本里，不靠模型临场发挥）：
+   *   只回 `dmToId` 这一个人；特殊称呼只给号主；每条 ≤100 字、不带链接；
+   *   同一条消息最多回 1 次；夜间静默；使唤式/引战/要隐私的一律不回；
+   *   第一拍只对表，不把历史消息重播一遍。
+   *
+   * ⚠️ 默认 **false** —— 这是**拿使用者账号对外说话**，得他自己点开。
+   */
+  dmAuto: z.boolean().default(false).extra('volatile', true),
+  /** 多久查一次私信（秒），30–3600，默认 90 */
+  dmAutoSec: z.natural().default(90).extra('volatile', true),
+  /** 每天最多自动回几条：0 = 不设上限，非零夹 1–999 */
+  dmAutoMax: z.natural().default(0).extra('volatile', true),   // 0 = 不设上限（2026-10-25 使用者要求）
+  /** 夜间静默区间（北京时间 HH:MM-HH:MM）：空串 = 不静默 */
+  dmAutoQuiet: z.string().default('').extra('volatile', true),   // '' = 不静默、全天都回（2026-10-25 使用者要求）
+  /**
+   * ⭐ 自动回抖音群聊（2026-10-27 使用者要求）。
+   *
+   * 原话：「没有被 @ 或被点名时回（默认），不做无差别接话，然后可以有 10% 的概率
+   *        去回复别人发的视频或者消息，群里发的视频要也抽帧看，所有群都监控，
+   *        没有回复上限，不要冷却」
+   *
+   * 走 `tools/group-reply.mjs` —— 与私聊那条链路完全独立的进程：
+   *   ① 只在被 @ 或被点名时回（默认）
+   *   ② 另外按 `groupChance` 概率主动回别人的视频/消息
+   *   ③ 群里视频也抽帧（`groupFrames`）
+   *   ④ 所有群都监控，无每日上限、无冷却
+   *
+   * ⚠️ 与 dmAuto 一样是**拿使用者账号对外说话**，默认 false。
+   */
+  groupAuto: z.boolean().default(false).extra('volatile', true),
+  /** 多久查一轮群聊（秒），60–3600，默认 120 */
+  groupAutoSec: z.natural().default(120).extra('volatile', true),
+  /** 非 @/点名消息的回复概率：0 = 只回 @/点名，1 = 每条都想办法回，默认 0.1（使用者定的 10%） */
+  groupChance: z.number().default(0.1).extra('volatile', true),
+  /** 群里的视频/图文要不要抽帧看。默认开（使用者明确要求） */
+  groupFrames: z.boolean().default(true).extra('volatile', true),
+  /**
+   * 自动回私信的范围。
+   *   · 'all'（默认）= 盯所有私聊会话，谁发来都回
+   *   · 'one'        = 只盯 dmToId 那一个人（老行为）
+   *
+   * 🔴 为什么要有这个键：dm-auto-reply.mjs 从 0.11.0 起就支持「不给 --peer 就盯所有会话」，
+   * 但 index.js 的 dmEnsure 一直写死传 `--peer <dmToId>`，于是多会话改造等于没生效 ——
+   * 使用者反馈「为什么还是回不了陌生人私信」就是这个。
+   */
+  dmScope: z.string().default('all').extra('volatile', true),
+  /**
+   * ⭐ 2026-10-26 加：自动回私信时**能不能发视频卡片**。
+   *
+   * 使用者原话：「为什么抖音里的小鲸鱼不会发我发视频?」—— 以前确实不会：
+   * 那条链路只会 `im-send.mjs --text` 打字，从不调 `card-share.mjs`。
+   * 抖音的分享卡片是前端把结构化消息交给服务端生成的，纯文字 + URL 做不出来，
+   * 而且文本链接在抖音里点不开。
+   *
+   * 现在接上了，但要控频：一次 card-share 要开新标签页跑 1~4 分钟，
+   * 且纯甩视频很突兀 —— 所以只在「刚好回过一句话」之后、按概率发。
+   *   · videoAuto      总开关
+   *   · videoEverySec  两条视频之间至少隔多少秒（默认 1800 = 30 分钟）
+   *   · videoMax       每天最多几条（0 = 不限）
+   *   · videoReplyChance  对方**发了视频**时，跟着回一条视频的概率
+   *   · videoIdleChance   对方只是说话时，主动分享一条的概率
+   */
+  videoAuto: z.boolean().default(true).extra('volatile', true),
+  videoEverySec: z.natural().default(1800).extra('volatile', true),
+  videoMax: z.natural().default(3).extra('volatile', true),
+  videoReplyChance: z.number().default(0.35).extra('volatile', true),
+  videoIdleChance: z.number().default(0.05).extra('volatile', true),
+  /**
+   * ⭐ 2026-10-25 加：回话前先查 AstrBot 的长期记忆（LivingMemory）。
+   *
+   * 抖音这边本来只有「本会话最近 16 条」，隔天再聊就白纸了；QQ 那边攒了
+   * 两百多条记忆（谁吃什么、聊过什么梗），人两边是同一个。
+   * 关掉就只靠本会话短期上下文，行为回到加这个功能之前。
+   * 依赖 `lib/memory-bridge.mjs`（走 AstrBot 面板接口，需要 AstrBot 在跑）。
+   */
+  memoryEnabled: z.boolean().default(true).extra('volatile', true),
   // ⚠️ 2026-10-24 petOn 已随桌宠搬到独立插件 dsh-deskpet（状态源 /pet/state 还在）。
   /**
    * ⭐ 2026-10-24 定稿（使用者：「我要的是迁移，不是开发新功能」）：
@@ -255,6 +366,19 @@ export function apply(ctx, config) {
     // ⭐ 聊天模式（2026-10-24 定稿：默认开启，使用者拍板；要关就整个关掉）。
     //    ⚠️ DEFAULTS / zod 必须同步（漏加过 ⇒ 开关点了没反应）。
     chatWatch: true, chatWatchSec: 30,
+    // ⭐ 自动回「别人 @ 我」（2026-10-25）。默认关：这是拿使用者账号对外说话。
+    atWatch: false, atWatchSec: 120, atWatchMax: 3, atWatchAweme: '', ownerUid: '',
+    // 自动回私信（2026-10-25）：默认关 —— 拿使用者账号对外说话，得他自己点开
+    dmAuto: false, dmAutoSec: 90, dmAutoMax: 0, dmAutoQuiet: '',
+    dmScope: 'all',
+    // ⭐ 自动回抖音群聊（2026-10-27）：默认关（拿账号对外说话）。只有 @/点名必回，
+    //    其余按 groupChance 概率回；群里视频抽帧；所有群都监控，无上限无冷却。
+    groupAuto: false, groupAutoSec: 120, groupChance: 0.1, groupFrames: true,
+    // ⭐ 自动回私信时发视频卡片（2026-10-26）。默认开，但每 30 分钟最多一条、每天 3 条
+    videoAuto: true, videoEverySec: 1800, videoMax: 3,
+    videoReplyChance: 0.35, videoIdleChance: 0.05,
+    // 回话前查 AstrBot 长期记忆（2026-10-25）；默认开，靠它才记得住跨天的旧事
+    memoryEnabled: true,
     reportLevel: 'full', pythonPath: 'python', dshBin: '', headlessProfile: 'headless',
     overlayMcp: true,
   }
@@ -416,8 +540,23 @@ export function apply(ctx, config) {
   const hasPkg = (venvRoot, prefix) => {
     try { return readdirSync(sitePkgs(venvRoot)).some((n) => n.startsWith(prefix)) } catch { return false }
   }
+  /**
+   * ⚠ 2026-10-28：Windows 上一律用 pythonw.exe，不用 python.exe。
+   *
+   * `spawnSync(..., { windowsHide: true })` 在这台机器上**压不住**控制台窗口 ——
+   * 实测同一个 im-http.py，python.exe 每次都在屏幕上闪一个
+   * ConsoleWindowClass 窗（标题就是 python.exe 的完整路径），
+   * pythonw.exe 则是 0 个窗口。原因是 Win11 把「新建控制台」交给了
+   * Windows Terminal 托管，WT 不受 CREATE_NO_WINDOW / ShowWindow=0 约束。
+   * pythonw 是 GUI 子系统程序，**根本不申请控制台**，于是没有窗口可弹。
+   *
+   * 输出不受影响：pythonw 只有在「自己是顶层进程、没有 stdout」时 sys.stdout 才是 None；
+   * 这里的 spawnSync 全都带 stdio 管道，Python 会自动把 stdout 绑到管道上。实测
+   * spawnSync(pythonw, ['-c','print("x")']) 能正常拿到 "x
+"。
+   */
   const venvPython = () => process.platform === 'win32'
-    ? join(stateDir, '.venv', 'Scripts', 'python.exe')
+    ? join(stateDir, '.venv', 'Scripts', 'pythonw.exe')
     : join(stateDir, '.venv', 'bin', 'python')
   /** ⭐ "就绪"必须检查依赖真的装上了，不能只看目录存不存在 */
   const venvReadyNow = () => existsSync(venvPython()) && hasPkg(join(stateDir, '.venv'), 'httpx')
@@ -561,7 +700,11 @@ export function apply(ctx, config) {
   const runNodeTool = (script, args = [], { timeout = 240_000 } = {}) => {
     const f = join(pluginDir, 'tools', script)
     if (!existsSync(f)) return { status: -1, stdout: '', stderr: `缺少 tools/${script}` }
-    const r = spawnSync(process.execPath, [f, ...args], {
+    // ⭐ 2026-10-29：这里以前是 process.execPath（DSH 的 Electron/node，Console 子系统=3），
+    //    每次调用都在屏幕上弹一个 Windows Terminal 窗口、把全屏游戏顶掉。
+    //    改成 no-control-console 的 node 副本（见 findNodeExe 上方那段说明）。
+    const runner = quietNode || process.execPath
+    const r = spawnSync(runner, [f, ...args], {
       encoding: 'utf8',
       timeout,
       env: pyEnv({ DOUYIN_HOME: stateDir }),
@@ -771,7 +914,12 @@ export function apply(ctx, config) {
         ],
         removed_2026_10_21: '删掉了 vendor/douyin-mcp（33 个文件 / 506 KB）和 bb-browser 那套驱动 —— 一个真数据都没跑通过',
         browser_policy: '可见浏览器只在扫码登录时用一次（tools/qr-login.mjs）；其余全是无头 Chrome 或纯 HTTP',
-        not_available: ['关键词搜索（抖音 web 没有可用搜索接口，只有推荐流）', '视频详情（web 详情接口被 ArgusSecurityPlugin 挡）'],
+        not_available: ['视频详情（web 详情接口被 ArgusSecurityPlugin 挡 —— 但抽帧理解走的是 video.bit_rate 直链，不受影响）'],
+        available_2026_10_27: {
+          '关键词搜索': '推荐流 tab/feed 只有视频；图文要单独走 /aweme/v1/web/general/search/single/（forward-pick.py 已加第 3 路，读 config.json 的 keywords）',
+          '图文作品': 'aweme_type=68 / media_type=2 / images[]；证据包带 is_image / images_n，视觉走 images 前 3 张',
+          '整段视频': '下载最低档 mp4（约 0.66MB）→ ffmpeg 抽 4/6/9 帧拼宫格 → 视觉读。证据包 how_seen 标 frames:N / images:N / cover',
+        },
       }
     },
   })
@@ -801,6 +949,16 @@ export function apply(ctx, config) {
           aweme_id: x.aweme_id, desc: x.desc, author: x.author,
           duration_s: x.duration_s, age_h: x.age_h,
           digg: x.digg, comment: x.comment, collect: x.collect, share: x.share,
+          /**
+           * ⭐ 2026-10-27 加：图文标记。
+           *
+           * 图文的 duration 是 null（`duration_s: null`），以前模型看到「时长未知」
+           * 会当成「拿不到时长的视频」，在 reason 里写「这条十几秒」这种瞎话。
+           * 带上 is_image / images_n 之后，模型知道这是 N 张图的图集，
+           * 措辞就能对上（图集不该提「几秒」「看个新鲜」）。
+           */
+          is_image: Boolean(x.is_image),
+          images_n: Number(x.images_n) || 0,
           ratios: {
             '评/赞': x.comment_ratio,
             '藏/赞': x.digg ? Number((x.collect / x.digg).toFixed(4)) : 0,
@@ -835,7 +993,7 @@ export function apply(ctx, config) {
       if (!existsSync(cookiePath(stateDir))) {
         return { ok: false, error: '还没有 Cookie', hint: '先扫码登录（tools/qr-login.mjs start），或设置页粘贴 Cookie' }
       }
-      const venvPy = join(stateDir, '.venv', 'Scripts', 'python.exe')
+      const venvPy = join(stateDir, '.venv', 'Scripts', 'pythonw.exe')
       const py = existsSync(venvPy) ? venvPy : (cfg.pythonPath || 'python')
       const r = spawnSync(py, [script], {
         encoding: 'utf8',
@@ -1113,7 +1271,7 @@ export function apply(ctx, config) {
       raw: { type: 'boolean', description: '连原始条目一起返回（默认 false）' },
     },
     async execute(args = {}) {
-      const venvPy = join(stateDir, '.venv', 'Scripts', 'python.exe')
+      const venvPy = join(stateDir, '.venv', 'Scripts', 'pythonw.exe')
       if (!existsSync(venvPy)) return { ok: false, error: '还没装运行环境', hint: '设置页点「装主依赖」' }
       if (!existsSync(cookiePath(stateDir))) return { ok: false, error: '还没有 Cookie', hint: '先扫码登录' }
       const argv = [join(pluginDir, 'tools', 'notice-read.py')]
@@ -1559,22 +1717,118 @@ export function apply(ctx, config) {
   })
 
   tool({
+    name: 'douyin_im_groups',
+    description: '列出我已建立的**抖音群聊**（type=2）：群名 + conv_id + 成员数/最后一条消息。只读，不发任何东西。'
+      + '拿到的 conv_id 传给 douyin_im_read 的 `group_id` 就能读那个群的聊天记录。'
+      + '⚠️ 只覆盖「已建立会话」（在消息列表里出现过的群）；没聊过、没被拉进去的群不在这里。',
+    parameters: {},
+    async execute() {
+      let j = null
+      try {
+        const r = runPy('im-http.py', ['--list-groups'], { timeout: 30_000 })
+        j = pickJson(r.stdout)
+      } catch (e) {
+        return { ok: false, error: `列群失败：${e?.message ?? e}` }
+      }
+      if (!j) return { ok: false, error: '列群失败：脚本没有输出 JSON' }
+      if (!j.ok) return j
+      log(`im-groups: ${j.group_count} 个群 / 共 ${j.conversation_count} 个会话，${j.ms}ms`)
+      return {
+        ok: true, via: 'http',
+        group_count: j.group_count,
+        conversation_count: j.conversation_count,
+        groups: j.groups,
+        hint: '读哪个群就把它的 conv_id 传给 douyin_im_read 的 group_id',
+      }
+    },
+  })
+
+  tool({
     name: 'douyin_im_read',
-    description: '读私信：**有 to_id（sec_uid）时先走纯 HTTP 快路径**（~1 秒，不启浏览器，每条带真实时间戳和发送者），'
+    description: '读私信/群聊：**有 to_id（sec_uid）时先走纯 HTTP 快路径**（~1 秒，不启浏览器，每条带真实时间戳和发送者），'
       + '目标按 sec_uid 反查核验、不在已建立会话里（比如陌生人）时自动退回无头 Chrome 路径。'
       + '每条都带 `from`（me / them / unknown），能分清「他刚回了什么」和「我上次说了什么」。只读，不发任何东西。'
+      + '⭐ **群聊**：传 `group_id`（群 conv_id，先用 douyin_im_groups 拿）就走群聊只读路径 —— '
+      + '群聊的 peer_uid 是群 id、不在人的 sec_uid 体系里，所以群聊**只按 conv_id 直读，不按人匹配**。'
       + '⭐ **会自动带上记忆**：返回里 `context` 是我记得的这个人（长期事实 + 之前聊过的内容），'
       + '回话之前先看它，别把聊过的事当没说过。返回里 `via` 标明这次走的哪条路。',
     parameters: {
       to: { type: 'string', description: '要打开的会话昵称；留空用配置 dmTo' },
       to_id: { type: 'string', description: '⭐ 稳定 id（sec_uid）；重名时给这个' },
+      group_id: { type: 'string', description: '⭐ 群聊 conv_id（douyin_im_groups 返回的 conv_id）。给了就走群聊只读，忽略 to/to_id' },
       limit: { type: 'number', description: '返回最近几条（默认 30，最多 60）' },
     },
     async execute(args = {}) {
+      const limit = Math.max(1, Math.min(Number(args.limit) || 30, 60))
+      const groupId = String(args.group_id || '').trim()
+
+      const withSeeHint = (list) => (Array.isArray(list) ? list : []).map((m) => {
+        const c = m?.card
+        if (!c) return m
+        const id = String(c.item_id || '').trim()
+        const u = String(c.url || '').trim()
+        const sk = String(c.skey || '').trim()
+        if (/^\d{6,}$/.test(id)) {
+          return {
+            ...m,
+            see_hint: {
+              tool: 'douyin_see',
+              args: { aweme_id: id },
+              why: '这是一条作品（视频或图文），上面的 text 只是标题，画面要用 douyin_see 去读',
+            },
+          }
+        }
+        if (/^https?:\/\//.test(u)) {
+          const k = String(c.kind || 'image').toLowerCase()
+          // 动图：card.url 是静帧（still.image），card.origin_url 才是整段动图。
+          // 优先给 origin_url —— 静帧只能看到一帧，"她做了什么"经常在后面的帧里。
+          const og = String(c.origin_url || '').trim()
+          const best = k === 'gif' && /^https?:\/\//.test(og) ? og : u
+          return {
+            ...m,
+            see_hint: {
+              tool: 'douyin_see',
+              args: { url: best, ...(sk ? { skey: sk } : {}), kind: k === 'gif' ? 'gif' : 'image' },
+              why: k === 'gif'
+                ? '这是一个动图，text 只是占位符「[动图]」，画面要用 douyin_see 去读（url 给的是整段动图，skey 别忘了）'
+                : '这是一张图片，text 只是占位符「[图片]」，画面要用 douyin_see 去读（注意 skey 别忘了）',
+            },
+          }
+        }
+        return m
+      })
+
+      // ⭐ 群聊只读路径（2026-10-27）：
+      //   🔴 群里没有「一个人」可以核验，peer_uid 是群 id。所以这里**不做身份推断**，
+      //      调用方必须给 conv_id，工具照单直读；不给就报错，绝不按昵称/序号猜群。
+      if (groupId) {
+        let j = null
+        try {
+          const r = runPy('im-http.py', ['--conv-id', groupId, '--limit', String(limit)], { timeout: 30_000 })
+          j = pickJson(r.stdout)
+        } catch (e) {
+          return { ok: false, error: `读群聊失败：${e?.message ?? e}` }
+        }
+        if (!j) return { ok: false, error: '读群聊失败：脚本没有输出 JSON' }
+        if (!j.ok) return j
+        const m = j.matched || {}
+        const allMsgs = Array.isArray(m.messages) ? m.messages : []
+        log(`im-read(群) ${m.name || groupId}: ${allMsgs.length} 条，${j.ms}ms`)
+        return {
+          ok: true, via: 'http', scope: 'group',
+          group: m.name || '(无名群)',
+          group_id: m.conv_id,
+          matched_by: j.matched_by,
+          count: m.message_count,
+          messages: withSeeHint(allMsgs),
+          their_latest: withSeeHint(allMsgs).filter((x) => x.from === 'them').slice(-3).reverse(),
+          note: '群聊只读：发送侧（im-send.mjs）只支持私聊，别拿这里的 group_id 去发消息',
+        }
+      }
+
       const to = String(args.to || cfg.dmTo || '').trim()
       const toId = String(args.to_id || cfg.dmToId || '').trim()
-      if (!to && !toId) return { ok: false, error: '不知道读谁的会话', hint: '传 to / to_id，或在设置里填私信对象' }
-      const limit = Math.max(1, Math.min(Number(args.limit) || 30, 60))
+      if (!to && !toId) return { ok: false, error: '不知道读谁的会话', hint: '传 to / to_id，或在设置里填私信对象；读群用 group_id' }
 
       /**
        * ⭐ 快路径（2026-10-24，二版）：先试纯 HTTP（tools/im-http.py，curl_cffi 伪装
@@ -1611,8 +1865,8 @@ export function apply(ctx, config) {
             them: allMsgs.filter((m) => m.from === 'them').length,
             unknown: 0,
             sender_attribution: '协议字段（发送者 uid，不是头像左右推断）',
-            messages: msgs,
-            their_latest: allMsgs.filter((m) => m.from === 'them').slice(-3).reverse(),
+            messages: withSeeHint(msgs),
+            their_latest: withSeeHint(allMsgs).filter((m) => m.from === 'them').slice(-3).reverse(),
             context: context || { note: '这个人以前没聊过（记忆里没有记录）' },
             memory: memory ? { rounds: memory.rounds, total: memory.total, added: memory.added } : null,
           }
@@ -1650,10 +1904,10 @@ export function apply(ctx, config) {
         ok: true, to: j.to, to_sec_uid: j.to_sec_uid, matched_by: j.matched_by,
         count: j.count, mine: j.mine, them: j.them, unknown: j.unknown,
         sender_attribution: j.sender_attribution,
-        messages: msgs,
+        messages: withSeeHint(msgs),
         // 他最近说的话（从新到旧），方便一眼看出要不要回。
         // ⚠️ 从**全量**算，不是从截断后的 msgs 算 —— 不然 limit 一小，他刚说的话就被切没了。
-        their_latest: allMsgs.filter((m) => m.from === 'them').slice(-3).reverse(),
+        their_latest: withSeeHint(allMsgs).filter((m) => m.from === 'them').slice(-3).reverse(),
         /** ⭐ 我记得的这个人（长期事实 + 之前聊过的）—— 回话前先看这个 */
         context: context || { note: '这个人以前没聊过（记忆里没有记录）' },
         memory: memory ? { rounds: memory.rounds, total: memory.total, added: memory.added } : null,
@@ -1770,6 +2024,121 @@ export function apply(ctx, config) {
     },
   })
 
+  /* ─────────────── 看一眼（补 2026-11-10 的窟窿） ─────────────── */
+  /**
+   * 🔴 2026-11-10 新增，起因是一次真实的翻车：
+   *
+   *   使用者发来一条图文作品（`itemId 7706176565289897209`，awemeType=68，1 张图），
+   *   `douyin_im_read` 只回了 `{text:"遥想公瑾当年.", item:"770617..."}` ——
+   *   **一个标题 + 一个 id，没有任何画面**。而当时 24 个 douyin_* 工具里
+   *   没有任何一个能「拿 item_id 去看一眼画面」，于是只能照着标题猜。
+   *   猜出来的话就是「我这边看不清字，只能说个意思」，然后被使用者当场抓到。
+   *
+   *   `tools/look-video.mjs` 其实早就写好了（看视频、看图文、读评论一条龙），
+   *   问题是**它从来没有被暴露成工具** —— `grep look-video index.js` 是空的。
+   *   这就是「能力有，但调不到」：工具清单里没有的东西，等于不存在。
+   *
+   *   所以这里给它补一个入口。支持三种输入，按消息里实际能拿到的字段来：
+   *     · `aweme_id` —— 图文/视频作品（`douyin_im_read` 返回的 `item` 字段）
+   *     · `url` + `skey` —— 私信里直接发的图片/动图（card.url / card.skey）
+   *     · `md5`/`url` 只用于去重日志，不影响识别
+   */
+  tool({
+    name: 'douyin_see',
+    description: '⭐ 真正「看」一条内容：给作品的 aweme_id（图文/视频），或私信图片的 url+skey，'
+      + '返回画面描述（逐字抄出图里的文字）+ 视频文案 + 高赞评论。'
+      + '🔴 为什么要有它：`douyin_im_read` 对图文/图片只返回标题和 item，**没有画面**；'
+      + '在拿到画面之前不要去描述那条内容 —— 照着标题猜一定会翻车。'
+      + '用法：读到一条 `kind:"card"` 的消息后，拿它的 `item` 调这里，再回话。',
+    parameters: {
+      aweme_id: { type: 'string', description: '作品 id（`douyin_im_read` 返回的 item 字段，纯数字 15 位以上）' },
+      url: { type: 'string', description: '私信图片/动图的地址（card.url 或 card.origin_url）' },
+      skey: { type: 'string', description: '私信图床的解密密钥（card.skey，64 位 hex）；图片消息必带，否则拿到的是密文' },
+      kind: { type: 'string', description: '图片消息的类型：image / gif（跟 card.kind 一致）' },
+      comments: { type: 'boolean', description: '要不要读评论（默认 true，作品才有效）' },
+      no_vision: { type: 'boolean', description: '只要元信息、不做视觉（调试用）' },
+    },
+    async execute(args = {}) {
+      const aid = String(args.aweme_id || '').replace(/\D/g, '')
+      const url = String(args.url || '').trim()
+      const skey = String(args.skey || '').trim()
+      const kind = String(args.kind || 'image').toLowerCase()
+      // ⚠️ 不要试图改 url 里的 `~tplv-x-get:` 后缀去拿"更大的图/整段动图"：
+      // 那串后缀是签名的一部分，改一个字符就 403（实测 medium/origin/thumb/空 全挂）。
+      // 要整段动图就让调用方传 card.origin_url（see_hint 已经这么带了）。
+
+      // ── 分支 A：私信图片/动图 —— 走 lib 里那条已经解过密的路径 ──
+      if (!aid && url) {
+        if (!/^https?:\/\//.test(url)) return { ok: false, error: 'url 不是 http(s) 地址' }
+        try {
+          const { fetchImageAsDataUri } = await import('./lib/video-understand.mjs')
+          const { describeImage } = await import('./lib/video-card.mjs')
+          const isGif = kind === 'gif'
+          const f = await fetchImageAsDataUri(url, {
+            maxBytes: isGif ? 8 * 1024 * 1024 : 6 * 1024 * 1024,
+            timeoutMs: 15_000,
+            skey,
+          })
+          if (!f?.ok || !f?.dataUri) {
+            return {
+              ok: false, seen: false,
+              error: String(f?.error || 'fetch_failed'),
+              hint: skey ? '解密失败，检查 skey 是否为 64 位 hex' : '抖音私信图床是 AES-256-GCM 密文，必须带 skey',
+            }
+          }
+          const prompt = [
+            isGif ? '这是对方发来的动图（只有一帧可看）。' : '这是对方发来的图片。',
+            '按下面顺序说，不要跳步：',
+            '① 把图里能看清的文字**尽量逐字抄下来**（正文、对话、按钮、标题、数字、水印都算）。',
+            '   文字往往就是这张图想说的内容，不要总结、不要改写成通顺句子。',
+            '② 再说这张图是什么：照片 / 手机截图 / 聊天记录 / 表情图 / 长图 / 纯文字卡片 / 表格。',
+            '③ 最后用一两句话说清画面里有什么（谁、在哪、在做什么）。',
+            '抄不出文字就说「图里没有可读的文字」，绝对不要编。总长度 300 字以内，文字多可以更长。',
+          ].join('\n')
+          const v = await describeImage(f.dataUri, { timeoutMs: 45_000, maxTokens: 900, prompt })
+          const scene = String(v?.ok ? v.text : '').trim()
+          if (!scene) return { ok: false, seen: false, error: String(v?.error || 'vision_failed') }
+          log(`douyin_see(图片) ${isGif ? 'gif' : 'image'} ${f.bytes}B${f.decrypted ? '/解密' : ''}`)
+          return {
+            ok: true, seen: true, kind: isGif ? 'gif' : 'image',
+            scene, bytes: f.bytes, decrypted: Boolean(f.decrypted), mime: f.mime || '',
+            note: isGif ? '动图只给了静帧，只能描述这一帧' : '',
+          }
+        } catch (e) {
+          return { ok: false, error: `看图片失败：${e?.message ?? e}` }
+        }
+      }
+
+      // ── 分支 B：作品（图文/视频）—— 走 look-video.mjs ──
+      if (!/^\d{6,}$/.test(aid)) {
+        return { ok: false, error: '既没给可用的 aweme_id，也没给 url', hint: 'aweme_id 是 douyin_im_read 返回的 item 字段（纯数字）' }
+      }
+      const argv = ['--aweme', aid]
+      if (args.comments === false) argv.push('--no-comments')
+      if (args.no_vision) argv.push('--no-vision')
+      const r = runNodeTool('look-video.mjs', argv, { timeout: 240_000 })
+      const j = pickJson(r.stdout)
+      if (!j) return { ok: false, error: '看不了这条作品（脚本没有输出 JSON）', stderr: String(r.stderr || '').slice(0, 400) }
+      if (j.ok) {
+        log(`douyin_see(作品) ${aid} how=${j.how_seen || '-'} scene=${String(j.scene || '').length}字`)
+        return {
+          ok: true, seen: Boolean(j.seen), aweme_id: aid,
+          scene: String(j.scene || ''), speech: String(j.speech || ''),
+          how_seen: String(j.how_seen || ''),
+          desc: String(j.desc || ''), author: String(j.author || ''),
+          cmts: Array.isArray(j.cmts) ? j.cmts : [],
+          ...(j.images_total ? { images_total: j.images_total, images_seen: j.images_seen } : {}),
+        }
+      }
+      return {
+        ok: false, seen: false, aweme_id: aid,
+        error: String(j.error || 'look_failed'),
+        ...(j.filter_msg ? { filter_msg: String(j.filter_msg) } : {}),
+        cmts: Array.isArray(j.cmts) ? j.cmts : [],
+      }
+    },
+  })
+
   tool({
     name: 'douyin_config',
     description: '读 / 改「刷抖音」的设置。不给 patch 就是读；给了就改。'
@@ -1853,15 +2222,42 @@ export function apply(ctx, config) {
    *    ⇒ 只要机器上有独立 node（开发机基本都有），就用它；没有才退回 Electron。
    *    （这也是 bili-scroll「桌面版上自动跑会卡/失败」那类反馈的根因之一。）
    */
+  /**
+   * ⭐⭐ 2026-10-29：无控制台的 node 解释器 —— 把 PE Subsystem 从 3(Console) 改成 2(GUI) 的副本。
+   *
+   * 🔴 起因：使用者反馈「打游戏被强行退出来」。查明是 Win11 把**新建控制台**交给
+   *    Windows Terminal 托管（`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Console\%%Startup`
+   *    的 DelegationConsole/DelegationTerminal 不存在 ⇒ 交给系统默认 = WT），
+   *    而 WT **不受** `CREATE_NO_WINDOW` / `ShowWindow=0` / `windowsHide:true` 约束 ——
+   *    所以本文件里所有 spawn 都带了 windowsHide，照样每次弹一个终端窗口抢焦点。
+   *
+   * ✅ 真正管用的只有一条：**让进程根本不申请控制台**。PE Subsystem 字段 = 2 的 exe
+   *    连「申请控制台」这一步都不会做，Windows 也就没有窗口可画。
+   *    实测：node.exe/ollama.exe/ python.exe 全是 2? 不 —— 它们都是 3；
+   *    pythonw.exe 和 DSH Desktop.exe 是 2，所以它们从来不弹。
+   *
+   * 做法：复制一份 node.exe，读 PE 头 `e_lfanew`(0x3C) → `+0x5C` 的 Subsystem 字节改成 2。
+   * 副本放在 `E:\_bot\bin\nodew.exe`（已验证 stdio 管道完全正常：stdout/stderr/stdin/argv 全通，
+   * GUI 子系统只是在「没有管道可绑」时才不给控制台，有管道时照样读写）。
+   *
+   * 可用 `cfg.nodeQuietBin` 或环境变量 `DOUYIN_NODEW` 覆盖；找不到就退回原逻辑（会弹窗但能跑）。
+   */
+  const quietNode = (() => {
+    const explicit = String(cfg.nodeQuietBin || process.env.DOUYIN_NODEW || '').trim()
+    for (const p of [explicit, 'E:\\_bot\\bin\\nodew.exe'].filter(Boolean)) {
+      try { if (existsSync(p)) return p } catch { /* 下一个 */ }
+    }
+    return ''
+  })()
+
   const findNodeExe = () => {
+    // ⭐ 先给无控制台副本 —— 它是 node 的完整拷贝，只是不申请控制台。
+    if (quietNode) return quietNode
     try {
-      const probe = spawnSync('node', ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 10_000 })
-      if (probe.status !== 0) return ''
-      if (!/^v\d+\./.test(String(probe.stdout || '').trim())) return ''
-      const which = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['node'],
-        { encoding: 'utf8', windowsHide: true, timeout: 10_000 })
-      const first = String(which.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0]
-      return first || 'node'
+      // 没有 quietNode 时只做存在性探测，绝不再 spawn 一个裸 'node' 或 'where' ——
+      // 两者都是 Console 子系统，在无控制台的父进程下会拉起可见的 Windows Terminal 窗口。
+      // 查 PATH 在 JS 里做即可（lib/quiet.mjs 的 whichInPath）。
+      return whichInPath('node') || ''
     } catch { return '' }
   }
   let nodeExeCache
@@ -2055,11 +2451,46 @@ export function apply(ctx, config) {
             const m = new RegExp('^\\s+' + k + ':\\s*(.+?)\\s*$', 'm').exec(block)
             return m ? m[1].replace(/^['"]|['"]$/g, '').trim() : ''
           }
-          const provider = grab('provider'); const model = grab('model'); const effort = grab('reasoningEffort')
-          if (provider && model) {
+          const rawProvider = grab('provider'); const rawModel = grab('model'); const rawEffort = grab('reasoningEffort')
+          if (rawProvider && rawModel) {
+            /**
+             * 🔴 2026-10-25 实测（本机必现，不修就每轮都失败）：
+             *    桌面版那一行写的是 `provider: workbuddy` / `model: deepseek-v4.1-flash` /
+             *    `reasoningEffort: high`，照抄进 overlay ⇒
+             *      dsh: UNKNOWN_MODEL: pi-ai provider "workbuddy" has no configured model "deepseek-v4.1-flash"
+             *    退出码 1，报告只剩占位。
+             *    原因：headless 装的是 `dsh-connect-workbuddy`，它的模型目录比桌面版窄，
+             *    没有 `.1-flash` 这个 id；能跑的是 `deepseek-v4-flash`。
+             *    另外 `deepseek-v4-flash` **不接受 reasoningEffort** —— high/max/low 三种取值
+             *    全部报 `UNSUPPORTED_REASONING_EFFORT`，所以对 workbuddy 系一律不写这个键。
+             *    ⇒ 照抄之前先过一层「headless 认得的名字」校正。
+             *    逃生口：DOUYIN_OVERLAY_PROVIDER / DOUYIN_OVERLAY_MODEL 环境变量可以直接钉死。
+             */
+            // 2026-10-27 实测（headless 真跑，纯文本轮 + 工具轮各验一次）：
+            //   纯文本轮能过：deepseek-v4-flash / deepseek-v4-pro / kimi-k2.6 / glm-5.3 / hy3
+            //   工具轮能过：  deepseek-v4-pro ✅ / glm-5.3 ✅ / hy3 ✅
+            //   工具轮崩：    deepseek-v4-flash ❌ / kimi-k2.6 ❌ —— 报的也是 UNKNOWN_MODEL
+            // ⇒ 这两个 id 的模型描述符在工具调用路径上解析不出来，纯文本轮看着"能用"是假象。
+            //   刷抖音整轮都要工具调用，所以兜底目标必须是**工具轮实测能过的** deepseek-v4-pro。
+            const WORKBUDDY_MODELS = new Set([
+              'deepseek-v4-pro', 'glm-5.3', 'hy3',
+            ])
+            const MODEL_ALIAS = {
+              'deepseek-v4-flash': 'deepseek-v4-pro', // 纯文本能用、工具轮崩，别放行
+              'deepseek-v4.1-flash': 'deepseek-v4-pro',
+              'deepseek-v4.1-flash-1017': 'deepseek-v4-pro',
+              'mimo-v2.6-pro': 'deepseek-v4-pro', // 桌面版走 qwen 通道时的 id
+            }
+            const provider = String(process.env.DOUYIN_OVERLAY_PROVIDER || rawProvider).trim()
+            // 只放行实测工具轮能过的；其余（含别的通道 id）一律兜底到 deepseek-v4-pro
+            const mapped = MODEL_ALIAS[rawModel] || (WORKBUDDY_MODELS.has(rawModel) ? rawModel : 'deepseek-v4-pro')
+            const model = String(process.env.DOUYIN_OVERLAY_MODEL || mapped).trim()
+            // workbuddy 那两路（cn/global）的模型都不吃 reasoningEffort，写了反而直接报错
+            const noEffort = /^workbuddy(-global)?$/.test(provider)
+            const effort = noEffort ? '' : rawEffort
             yml.push('- id: agent-default-model', "  name: '@deepseek-ai/dsh-agent-default-model'", '  config:',
               `    provider: '${provider}'`, `    model: '${model}'`, ...(effort ? [`    reasoningEffort: '${effort}'`] : []), '')
-            log(`overlay: 模型跟随桌面版 = ${provider} / ${model}`)
+            log(`overlay: 模型跟随桌面版 = ${provider} / ${model}（桌面写的 ${rawProvider} / ${rawModel}${rawModel !== model ? ' → 已按 headless 目录改名' : ''}）`)
           }
         }
       }
@@ -2076,10 +2507,18 @@ export function apply(ctx, config) {
      *    挂进那一轮。它跟 DSH 里的 douyin_* 共用同一批脚本，
      *    发送类工具仍然带 confirm 闸 —— 自动跑时提示词会明确告诉它传 confirm:true。
      *
-     * ⚠️ 只在 `autoSend` 开着的时候挂：
-     *    关着的时候连工具都不给，从**能力层**保证"发不出去"，比靠提示词约束更硬。
+      * ⚠️ 挂载条件是 `autoSend || commentAtMe`：
+     *    两个都关着的时候连工具都不给，从**能力层**保证"发不出去"，比靠提示词约束更硬。
+     *
+     * 🔴 2026-10-29 拆开（第 4 档分工）：
+     *    原来只认 `autoSend`，于是「关掉 DSH 自己发卡片、全交 QQ 发」这个操作
+     *    会把 MCP 工具整个抽走 ⇒ 连「在评论区 @ 你」也一起死掉。
+     *    但真 @ 走的是 comment-mention-ui.mjs 的 UI 点选（要 CDP + 有头 Chrome），
+     *    **QQ 侧根本没有这个能力** ⇒ 这条必须留在 DSH。
+     *    ⇒ 改成 autoSend 管「发卡片/发私信」，commentAtMe 管「评论区 @」，
+     *      两个开关各管一件事，挂工具看的是"两者之一还要不要"。
      */
-    if (cfg.autoSend) {
+    if (cfg.autoSend || cfg.commentAtMe) {
       try {
         const mcpServer = join(pluginDir, 'tools', 'mcp-server.mjs')
         if (existsSync(mcpServer)) {
@@ -2225,10 +2664,21 @@ export function apply(ctx, config) {
           + `   - 发私信：\`douyin_dm\`（参数 to / to_id / text / confirm:true）\n`
           + `   - 发分享卡片：\`douyin_share_card\`（参数 aweme_id / to / to_id / reason / confirm:true）—— 文字链接点不开，**必须用它**\n`
           + `   - 发评论 / 回复评论：\`douyin_comment_reply\`（参数 aweme_id / text / comment_id? / confirm:true）\n`
+          + `   - 真 @：\`douyin_comment_mention\`（参数 aweme_id / name / text / confirm:true）\n`
           + `   - 查状态：\`douyin_status\` / \`douyin_whoami\`\n`
           + `   ⚠️ 采集和算比值仍然是代码干的活（证据包已经抓好），你不用重新取候选。\n`
           + `   ⚠️ 发送类工具**必须传 confirm:true**，否则只回草稿不发送。\n`
-        : ` ⚠️ 这一轮**你手上没有 douyin\\_* 工具**（自动发送关着）—— 采集和算比值是代码干的活，你只负责判断和写报告。\n`)
+        /**
+         * 🔴 2026-10-29 新分支（第 4 档分工）：autoSend 关着、但「在评论区 @ 你」开着。
+         *    工具**还在手上**，但只准用 mention 那一个 —— 卡片归 QQ 侧发，DSH 不许再发。
+         */
+        : (cfg.commentAtMe && cfg.mentionName && cfg.commentExecutor !== 'off')
+          ? ` ⭐ **这一轮你手上有 douyin 抖音工具，但只用得上一个**（以你手上真实的工具清单为准，名字可能带 \`mcp__douyin__\` 前缀）：\n`
+            + `   - ✅ 可以用：\`douyin_comment_mention\`（真 @，参数 aweme_id / name / text / confirm:true）\n`
+            + `   - 🔴 **不许用** \`douyin_share_card\` / \`douyin_dm\` —— 发卡片这件事已经交给另一个端做（它读你的报告、按自己的人设发），\n`
+            + `       你在这里再发一遍 = 同一个视频发两次卡片，他看到会莫名其妙。\n`
+            + `   ⚠️ 采集和算比值仍然是代码干的活（证据包已经抓好），你不用重新取候选。\n`
+          : ` ⚠️ 这一轮**你手上没有 douyin\_* 工具**（自动发送和评论都关着）—— 采集和算比值是代码干的活，你只负责判断和写报告。\n`)
       + `⚠️ 抖音 web **没有可用的关键词搜索接口**，上面这些关键词/分类**只能当报告里的标注**，别以为它按词搜了。`
       + `\n🔎 **判断口径**（章程里有更细的）：你**看不到画面**，只能看**文案 + 标签 + 互动比值 + 高赞评论**。`
       + `所以你要回答的是「**值不值得他花 15 秒点开**」，不是「视频讲了什么」。`
@@ -2246,11 +2696,18 @@ export function apply(ctx, config) {
       /**
        * ⭐ 自动发送总开关（autoSend）—— 这一段是"后台跑一轮时到底能不能发东西"的唯一判据。
        *    默认开（用户要求）；关掉就一个字都不许发。
+       *
+       * 🔴 2026-10-29 改（第 4 档分工）：关着的时候不再等于"什么都不许发"，
+       *    而是"发卡片/私信不归你管了，归 QQ 那个端"；评论区的 @ 仍然归 DSH，
+       *    因为真 @ 要 CDP 点选，QQ 侧没有这个能力。
        */
       + (!cfg.autoSend
-        ? `🔴 **自动发送关着**：**一个字都不要往抖音发** —— 不发私信、不发卡片、不发评论。`
-          + `\n   这一轮你只干两件事：① 读 round-evidence.json 判断 ② 写报告。`
-          + `\n   报告里可以写「建议发给他：xxx」，但**不要真的调用任何发送工具**。`
+        ? `🔴 **发卡片这件事不归你了** —— 不开分享卡片、不发私信。`
+          + `\n   ⭐ 原因：另一个端（QQ 那个）会读你写的这份报告，按她自己的人设把卡片发给他。`
+          + `\n   🔴 所以：**不要调用 \`douyin_share_card\` / \`douyin_dm\`** —— 你再发一遍就是同一个视频两张卡片。`
+          + `\n   报告照旧写全（尤其「一句话」和「为什么值得」两栏，那是她发卡片时要用的素材）。`
+          + `\n   报告里写「待发：<视频ID>」就够，别写「已发卡片」。`
+          + (cfg.commentAtMe ? '' : `\n   📝 评论也一起关着，这一轮只判断、只写报告。`)
         : [
           /**
            * 🔴 2026-10-22 收紧：原来写「可以发私信/分享卡片」——模型把它当可选项，
@@ -2258,55 +2715,90 @@ export function apply(ctx, config) {
            *    挑到推荐（### 那条）⇒ **必须**发分享卡片给 dmTo（reason 里带理由，
            *    工具自己保证先卡片后文字）。@ 评论是叠加任务，不是替代。
            */
-          `🟡 **自动发送开着 —— 挑到推荐（加了 \`###\` 那条）后必须发**：\n`
-          + `   ① **必发分享卡片**：调 \`douyin_share_card\`，参数：\n`
-          + `      - aweme_id = 推荐那条的 ID\n`
+          `🟡 **自动发送开着 —— 挑到的每一条推荐（加了 \`###\` 那条）都要发**：\n`
+          + `   ⭐ **有几条 \`###\` 就发几张卡片**（同一轮 3 条推荐 = 3 张卡片），\n`
+          + `      只有「同一个视频」才不许发两遍。别把「一轮最多发一次」误读成整轮只发 1 条。\n`
+          + `   ① 对**每一条**推荐都调一次 \`douyin_share_card\`，参数：\n`
+          + `      - aweme_id = 那一条的 ID（一条一次调用）\n`
           + `      - to_id = '${String(cfg.dmToId || '').trim()}'（**私信目标**，配置里的稳定 id）\n`
           + `      - to = '${String(cfg.dmTo || '').trim()}'（只用于显示的昵称）\n`
-          + `      - reason = 为什么值得看，30-80 字\n`
+          + `      - reason = 那一条为什么值得看，**20-60 字**（各写各的，别复制同一句）\n`
+          // 2026-10-27 修：使用者原话「她发视频之后给的那个评论太没有活人感了」。
+          // 旧规则只说「为什么值得看」，没禁指标 ⇒ 模型每句都念「转/赞 0.62、藏赞比 0.17、转发 91 万」，
+          // 念出来像数据日报，不像人推荐视频。这条是给人看的私信，不是分析报告。
+          + `        ⭐ reason 要像**随手打给人**的一句话，不像报告：\n`
+          + `          · 先写画面/梗本身（视频里到底发生了啥、哪一秒好笑），再写你什么反应\n`
+          + `          · 🔴 **禁止任何数字指标**：不许出现「转/赞」「藏/赞」「万赞」「倍数」「0.62」「91万」\n`
+          + `            「参与度」「信号」「置信度」「数据」这类词 —— 那是报告里的「为什么值得」栏，\n`
+          + `            不是私信。（报告里照旧写指标，私信里一个字都别带）\n`
+          + `          · 短句、口语、少标点。像发微信不像写作文\n`
+          + `          ✅「狗头卡进纸箱那个洞，翻来翻去一脸无所谓，评论区一句怎么翻都有面，笑死」\n`
+          + `          ✅「猫凑到洋葱旁边闻了一下 眼睛直接红成那样 后面还硬撑着不走」\n`
+          + `          ✗「转/赞 1.06，转发比点赞还多，是本轮最强的想转给朋友的信号」（数据播报）\n`
+          + `          ✗「双梗叠加，转发是点赞的0.62倍，12秒看个新鲜」（数据 + 分析腔）\n`
           + `      - confirm = true\n`
+          + `      ⚠️ 两条卡片之间隔几秒再发下一条（工具自己会把 reason 排在卡片后面）\n`
           + `      ⚠️ 不要再单独调 \`douyin_dm\` 补文字 —— reason 会自动排成「先卡片、后理由」\n`
-          + `   ② 发完在报告里写一行「已发卡片：<视频ID>」`,
+          + `   ② 发完在报告里**逐条**写「已发卡片：<视频ID>」（发了几条写几行）`,
           (commentOn
             ? `📝 自动评论也开着：每轮最多 ${Number(cfg.commentPerRun) || 0} 条，每条 **≤120 字**，`
-              + `**正文必须以「@${cfg.mentionName} 」开头**。发前先调 \`douyin_comment_status\` 确认 allowed=true。`
+              + `**正文必须以「@${cfg.mentionName} 」开头**。直接发就好，不用先做任何「额度确认」。\n`
+              + `   ⚠️ 这条和下面「在评论区 @ 你」**共用同一个额度** —— 真 @ 已经发了，`
+              + `就别再补一条普通评论（同一个视频下面留两条 = 刷屏）。`
             : `📝 评论：默认不发。`),
-          /**
-           * ⭐⭐ 「在评论区 @ 你」—— 用户 2026-10-22 要求。
-           *    这一轮挑到值得看的视频后，去那个视频的评论区发一条 @ 使用者本人的评论。
-           *    前提：autoSend 开着 + commentAtMe 开着 + 知道要 @ 谁。
-           *
-           * ⭐ 2026-10-23 判断规则定稿（使用者连着问了两次，前两版都想错了）：
-           *    这个功能是**主动推东西**给使用者 —— 那个视频下面**没有他的评论可回**
-           *    ⇒ 属于"没有对话对象"，所以用 @ 顶层是**正确的**。
-           *    但「有人 @ 我，回他」是另一回事：有 comment_id ⇒ 必须**直接回复**，不许用 @。
-           *    规则一句话：**有评论可回就回复，没评论可回才 @。**
-           */
-          (cfg.commentAtMe
-            ? (() => {
-              const who = String(cfg.commentSelfName || '').trim() || (readJson(join(stateDir, 'account.json'), {})?.nick || '')
-              if (!who) {
-                return `⚠️ 「在评论区 @ 你」开着，但**不知道要 @ 谁**（commentSelfName 空、account.json 也没有昵称）`
-                  + ` ⇒ 这一轮**跳过 @ 评论**，只写报告。`
-              }
-              return `🔴 **「在评论区 @ 你」开着 —— 这是这一轮的重点任务**：\n`
-                + `   ⭐ 为什么这里用 @ 而不是"直接回复"：这个视频下面**没有他的评论可回**，\n`
-                + `      只能靠 @ 通知把他叫过来。这是 @ 唯一该用的场景。\n`
-                + `   挑到**最值得的那 1 条**（只挑 1 条，别贪）之后：\n`
-                + `   ① 调 \`douyin_comment_reply\`，**mode = "ui"**（真 @，UI 点选，会起无头 Chrome，约 20-40 秒），参数：\n`
-                + `      - aweme_id = 那条视频的 ID\n`
-                + `      - mode = "ui"\n`
-                + `      - mention_name = "${who}"（**必须和对方昵称完全一致**）\n`
-                + `      - text = 一句 20-60 字的话（**不要自己写 @${who}**，工具会自动加这个 mention）\n`
-                + `      - confirm = true（自动跑，不用再问）\n`
-                + `      ⚠️ 如果返回 \`@ 弹层里没找到这个名字\` ⇒ 这一轮**放弃 @**，在报告里写明\n`
-                + `        「真 @ 没成（昵称搜不到）」—— **不要**改成发普通评论凑数（那是刷屏）。\n`
-                + `   ② 评论内容像这样：「这条我觉得你会喜欢 —— <一句话理由>」\n`
-                + `   ③ 发完在报告里写一行「已在评论区 @ 你：<视频ID>」\n`
-                + `   ⚠️ 只在**最值得的那一条**发，不要每条都发（会被当成刷屏）。`
-            })()
-            : `📝 「在评论区 @ 你」：关着，不要发这类评论。`),
+          // ⭐ 「在评论区 @ 你」已搬出这个数组（2026-10-29）—— 见下面 autoSend 判断之后那段。
+          //    原因：它原来嵌在这里 ⇒ 一关 autoSend 整段消失，真 @ 跟着死掉；
+          //    但真 @ 要 CDP 点选，QQ 侧没有这个能力，所以必须独立存活，只受 commentAtMe 管。
         ].filter(Boolean).join('\n'))
+      /**
+       * ⭐⭐ 「在评论区 @ 你」—— 用户 2026-10-22 要求。
+       *    这一轮挑到值得看的视频后，去那个视频的评论区发一条 @ 使用者本人的评论。
+       *    前提：commentAtMe 开着 + 知道要 @ 谁。
+       *
+       * 🔴 2026-10-29 从 autoSend 数组里搬出来（第 4 档分工）：
+       *    原来它嵌在 `autoSend 开着` 的那个数组里 ⇒ 一关 autoSend，这段提示整段消失，
+       *    真 @ 跟着一起死。但真 @ 要 CDP 点选（comment-mention-ui.mjs），QQ 侧没有这个能力
+       *    ⇒ 它必须独立存活，只受 commentAtMe 管。
+       *
+       * ⭐ 2026-10-23 判断规则定稿（使用者连着问了两次，前两版都想错了）：
+       *    这个功能是**主动推东西**给使用者 —— 那个视频下面**没有他的评论可回**
+       *    ⇒ 属于"没有对话对象"，所以用 @ 顶层是**正确的**。
+       *    但「有人 @ 我，回他」是另一回事：有 comment_id ⇒ 必须**直接回复**，不许用 @。
+       *    规则一句话：**有评论可回就回复，没评论可回才 @。**
+       */
+      + (cfg.commentAtMe
+        ? (() => {
+          const who = String(cfg.commentSelfName || '').trim() || (readJson(join(stateDir, 'account.json'), {})?.nick || '')
+          if (!who) {
+            return `⚠️ 「在评论区 @ 你」开着，但**不知道要 @ 谁**（commentSelfName 空、account.json 也没有昵称）`
+              + ` ⇒ 这一轮**跳过 @ 评论**，只写报告。`
+          }
+          return `🔴 **「在评论区 @ 你」开着 —— 这是这一轮的重点任务**：\n`
+            + `   ⭐ 为什么这里用 @ 而不是"直接回复"：这个视频下面**没有他的评论可回**，\n`
+            + `      只能靠 @ 通知把他叫过来。这是 @ 唯一该用的场景。\n`
+            + `   挑到**最值得的那 1 条**（只挑 1 条，别贪）之后：\n`
+            // 2026-10-27 修：headless 轮挂的是 mcp-server.mjs 那层，它的 douyin_comment_reply
+            // 只有 aweme_id/text/comment_id/root_comment_id/confirm，**没有 mode、没有 mention_name**
+            // ⇒ 旧提示词让模型去调一个不存在的参数，每轮都要自己纠错一遍。真 @ 的工具是 douyin_comment_mention。
+            + `   ① 调 \`douyin_comment_mention\`（真 @，UI 点选，会起无头 Chrome，约 20-40 秒），参数：\n`
+            + `      - aweme_id = 那条视频的 ID\n`
+            + `      - name = "${who}"（**必须和对方昵称完全一致**）\n`
+            + `      - text = 一句 20-60 字的话（**不要自己写 @${who}**，工具会自动加这个 mention）\n`
+            + `      - confirm = true（自动跑，不用再问）\n`
+            + `      ⚠️ 如果返回 \`@ 弹层里没找到这个名字\` ⇒ 这一轮**放弃 @**，在报告里写明\n`
+            + `        「真 @ 没成（昵称搜不到）」—— **不要**改成发普通评论凑数（那是刷屏）。\n`
+            // 2026-10-27 修：旧模板「这条我觉得你会喜欢 —— <一句话理由>」是明显的模板腔，
+            // 破折号 + 万能开场白，谁看都知道是机器发的。评论区的话要像随手评论。
+            + `   ② 评论内容（20-60 字）：**直接说视频里那一幕**，别加"这条我觉得你会喜欢"这类开场白，\n`
+            + `      也别用破折号硬接。「@${who} 」工具会自己加，你只管正文。\n`
+            + `      🔴 同样**不许出现任何数字指标**（转/赞、藏/赞、万赞、倍数、参与度）—— 评论区没人这么说话。\n`
+            + `      ✅「洋葱那一刀下去 它凑过去闻 眼睛当场就红了 还不走 笑不活了」\n`
+            + `      ✅「翻来翻去都一脸无所谓 评论区那句怎么翻都有面 精准」\n`
+            + `      ✗「这条我觉得你会喜欢 —— 转/赞 1.06 是本轮最强信号」\n`
+            + `   ③ 发完在报告里写一行「已在评论区 @ 你：<视频ID>」\n`
+            + `   ⚠️ 只在**最值得的那一条**发，不要每条都发（会被当成刷屏）。`
+        })()
+        : ``)
       + `\n⭐ 保底：不管发生什么，**报告至少留一行**（哪怕只写「本轮失败：原因是 X」），别让 out/ 空着。`
       + `\n最后用两三句话汇报你挑到了什么。`
   }
@@ -2572,6 +3064,9 @@ export function apply(ctx, config) {
           aweme_id: x.aweme_id, desc: x.desc, author: x.author,
           duration_s: x.duration_s, age_h: x.age_h,
           digg: x.digg, comment: x.comment, collect: x.collect, share: x.share,
+          // ⭐ 2026-10-27 加：图文标记（图集 duration 为 null，别让模型当视频说「几秒」）
+          is_image: Boolean(x.is_image),
+          images_n: Number(x.images_n) || 0,
           ratios: {
             '评/赞': x.comment_ratio,
             '藏/赞': x.digg ? Number((x.collect / x.digg).toFixed(4)) : 0,
@@ -2752,7 +3247,11 @@ export function apply(ctx, config) {
 
       for (const w of range) {
         if (!inWindow(now, w)) continue
-        const key = `${today}:${w.key}`
+        // ⭐ 2026-10-27 修跨午夜 bug：key 的前缀必须是「这个窗口开始那天」，
+        //    不能用 today —— night 是 18:00–09:00，用 today 会把同一个夜晚切成两天，
+        //    而且昨晚凌晨跑过之后，今天 18:00 起的整晚都会顶着同一个 key 被判「已跑过」，
+        //    定时器一动不动。详见 lib/state.mjs 的 windowDayKey 注释。
+        const key = `${windowDayKey(now, w)}:${w.key}`
         if (st.windows?.[key]) continue
         // 只记「这个时段用过了」；轮数 / lastRunAt / lastWhy 由 runDuty 统一记
         bumpState({ windows: { ...(st.windows || {}), [key]: true } })
@@ -2833,7 +3332,14 @@ export function apply(ctx, config) {
         chatWatchLog(`已接上班（基准 = ${chatWatchLastSeenAt || '无对方消息'}，之前的不重播）`)
         return
       }
-      if (!theirs.length) { cwWrite({ lastCheckAt: Date.now(), lastResult: 'ok', lastError: '' }); return }
+      // ⭐ 2026-10-25 修：`lastNote` 以前只在 no_match 分支写、别的分支不清
+      //    ⇒ 修好之后 lastResult 已经是 ok，面板上却还挂着上一拍的
+      //    「这个人不在已建立会话里」，看着像还在坏。
+      //    现在读取成功的分支一律把 note 清掉，并带上读到了几条（眼睛是活的）。
+      if (!theirs.length) {
+        cwWrite({ lastCheckAt: Date.now(), lastResult: 'ok', lastNote: '', lastError: '', readCount: msgs.length })
+        return
+      }
       // 基准推进：插件只负责「看见 + 提醒」；回话由 AI 值班（常驻会话）做，
       // 它有自己的读取基准，不和这里的混淆。
       chatWatchLastSeenAt = theirs[theirs.length - 1].at
@@ -2861,6 +3367,395 @@ export function apply(ctx, config) {
     cw.unref?.()
     ctx.effect(() => () => clearInterval(cw), 'douyin-duty: 聊天盯梢')
   } catch (e) { log(`聊天盯梢没起来：${e?.message ?? e}`) }
+
+  /* ─────────────── ⭐ 自动回「别人 @ 我」（2026-10-25，使用者要求） ───────────────
+   * 使用者原话：「让她自己能自动回复别人的艾特」。
+   *
+   * 与上面 chatWatch 的区别：
+   *   · chatWatch 盯的是**私信**（im-http.py，HTTP 快路径，只看见不回复）
+   *   · atWatch   盯的是**评论区 @**（notice-read.py 读 type 45/46），而且**会真的回复**
+   *
+   * 为什么不在这一层自己写回复逻辑，而是拉 tools/at-me-watch.mjs：
+   *   那个脚本里把「谁能被回、回几句、同一人只回一次、撞 403 立刻停」全写死了，
+   *   不靠模型临场发挥 —— 这条正是「拿使用者账号对外说话」时要的确定性。
+   *   state 记在 $DOUYIN_HOME/at-watch.json，重启不会重复回同一条。
+   *
+   * 守护方式：长驻子进程 + 每 60 秒体检一次；配置改了（开关/间隔/条数）自动重启。
+   * 🔴 子进程必须自己兜住：它挂了要能拉起来，但**不许无限重启轰炸**（连续 3 次失败就停到下一轮体检）。
+   */
+  let atProc = null
+  let atProcSig = ''
+  let atFailStreak = 0
+  const atStateFile = join(stateDir, 'at-watch-state.json')
+  const atLog = (s) => { try { appendFileSync(join(stateDir, 'at-watch.log'), `[${new Date().toISOString()}] ${s}\n`, 'utf8') } catch { /* 日志写不进就算了 */ } }
+  const atWriteState = (patch) => {
+    try {
+      const cur = readJson(atStateFile, {}) || {}
+      writeFileSync(atStateFile, JSON.stringify({
+        ...cur, ...patch, ts: Date.now(),
+        on: Boolean(cfg.atWatch),
+        sec: Math.max(30, Math.min(Number(cfg.atWatchSec || 120), 3600)),
+        max: Math.max(1, Math.min(Number(cfg.atWatchMax || 3), 20)),
+        scope: String(cfg.atWatchAweme || '').trim() || '全站',
+        pid: atProc ? atProc.pid : null,
+      }, null, 1), 'utf8')
+    } catch { /* 状态写不进也不能出事 */ }
+  }
+  const atKill = () => {
+    if (!atProc) return
+    try { atProc.kill() } catch { /* 已经死了 */ }
+    atProc = null
+    atProcSig = ''
+  }
+  const atEnsure = () => {
+    try {
+      refreshCfg()
+      if (!cfg.atWatch) {
+        if (atProc) { atKill(); atLog('开关关了 ⇒ 停掉盯 @ 进程'); atWriteState({ result: 'off' }) }
+        return
+      }
+      if (!hasCredential(stateDir)) { atWriteState({ result: 'skip_no_login' }); return }
+      const sec = Math.max(30, Math.min(Number(cfg.atWatchSec || 120), 3600))
+      const max = Math.max(1, Math.min(Number(cfg.atWatchMax || 3), 20))
+      /**
+       * 🔴 2026-10-27 加：当天配额满了就别再拉子进程。
+       *
+       * 实测事故：`at-me-watch.mjs` 的主循环是 `while (st.count < MAX)`，
+       * 而 `st.count` 是**当天累计已回条数**、`MAX` 是每天上限。
+       * 今天 5 条配额一满，脚本启动后一次都不进循环、立刻 `process.exit(0)`；
+       * index.js 的 60 秒体检看到进程没了又拉 → 又立刻退出 ——
+       * 于是每 60 秒空转一次，at-watch.log 里刷满
+       * 「盯 @ 已启动 → 盯 @ 进程退出（code=0）」。
+       * 一整天下来几百次无意义 spawn，还让使用者以为程序在跑。
+       *
+       * 修法：拉起之前先读 at-watch.json，把「日期 + 已回条数 + 上限」比一遍。
+       * 只有当天的计数才作数（跨天自动复位，与脚本里 `st.day !== dayKey()` 同口径）。
+       */
+      let quotaFull = false
+      try {
+        const at0 = readJson(join(stateDir, 'at-watch.json'), {})
+        const used = at0?.day === dayKey() ? Number(at0.count || 0) : 0
+        if (used >= max) {
+          quotaFull = true
+          if (atProc) { atKill(); atLog('今日配额已满 ⇒ 停掉盯 @ 进程') }
+          atWriteState({ result: 'quota_full', used, max })
+        }
+      } catch { /* 读不到就当没满，交给脚本自己判断 */ }
+      if (quotaFull) return
+      const aweme = String(cfg.atWatchAweme || '').trim()
+      const owner = String(cfg.ownerUid || cfg.dmToId || '').trim()
+      const sig = `${sec}|${max}|${aweme}|${owner}`
+      if (atProc && atProcSig === sig) return          // 已经在跑且参数没变
+      if (atProc) { atKill(); atLog('参数变了 ⇒ 重启盯 @ 进程') }
+      const args = [join(pluginDir, 'tools', 'at-me-watch.mjs'),
+        '--max', String(max), '--every', String(sec)]
+      if (aweme) args.push('--aweme', aweme)
+      if (owner) args.push('--owner-uid', owner)
+      /**
+       * ⭐ 用真正的 node.exe 跑常驻子进程，不用 `process.execPath`。
+       *
+       * 🔴 2026-10-25 实测（一整天的死循环）：DSH Desktop 是 Electron 宿主，
+       *    `process.execPath` 指向 `DSH Desktop.exe`。不带 ELECTRON_RUN_AS_NODE
+       *    时它把自己当 GUI 启动 —— **立刻以 code=0 返回**，脚本一行都没跑。
+       *    日志表现：`盯 @ 已启动 → 进程退出（code=0）` 每 60 秒循环，
+       *    看着一直在跑，实际一条 @ 都没回过。
+       *    （上面 resolveDsh 那段已经踩过同一个坑，这里漏了。）
+       */
+      const atRunner = nodeExe() || process.execPath
+      /** 🔴 2026-10-27 同 dmEnsure：exit 回调必须认 child，否则迟到的 exit 会把新进程引用抹掉，进程越堆越多 */
+      const atChild = spawn(atRunner, args, {
+        cwd: stateDir, env: { ...process.env, DOUYIN_HOME: stateDir, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', ...(nodeExe() ? {} : { ELECTRON_RUN_AS_NODE: '1' }) },
+        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      atProc = atChild
+      atProcSig = sig
+      atFailStreak = 0
+      // 每一行输出（一条 JSON）落到 at-watch.log，面板/使用者都能看
+      try { atChild.stdout.on('data', (b) => { const s = String(b || '').trim(); if (s) atLog(s.slice(0, 400)) }) } catch { /* pipe 异常不影响 */ }
+      try { atChild.stderr.on('data', (b) => { const s = String(b || '').trim(); if (s) atLog(`[stderr] ${s.slice(0, 300)}`) }) } catch { /* 同上 */ }
+      atChild.on('exit', (code) => {
+        atLog(`盯 @ 进程退出（code=${code}${atProc === atChild ? '' : '，非当前进程'}）`)
+        if (atProc === atChild) { atProc = null; atProcSig = '' }
+        if (code !== 0) atFailStreak += 1
+        atWriteState({ result: 'exited', exit_code: code })
+      })
+      atLog(`盯 @ 已启动：每 ${sec} 秒 / 最多回 ${max} 条 / 范围=${aweme || '全站'} / 号主=${owner || '(未指定)'}`)
+      atWriteState({ result: 'started', error: '' })
+    } catch (e) {
+      atFailStreak += 1
+      atLog(`盯 @ 没起来（第 ${atFailStreak} 次）：${e?.message ?? e}`)
+      atWriteState({ result: 'error', error: String(e?.message ?? e).slice(0, 160) })
+    }
+  }
+  try {
+    const atT = setInterval(() => {
+      // 连续 3 次重启都失败 ⇒ 这一轮不硬拉，等下一轮（避免死循环重启把 CPU 打满）
+      if (atFailStreak >= 3) { atFailStreak = 0; atLog('连续失败 3 次 ⇒ 跳过这次体检'); return }
+      atEnsure()
+    }, 60_000)
+    atT.unref?.()
+    ctx.effect(() => () => { clearInterval(atT); atKill() }, 'douyin-duty: 盯 @ 进程')
+    atEnsure()                                   // 启动时就来一次，别等 60 秒
+  } catch (e) { log(`盯 @ 定时器没起来：${e?.message ?? e}`) }
+
+  /* ─────────────── ⭐ 自动回「私信」（2026-10-25，使用者：「私聊已读不回呢」） ───────────────
+   * 上面 chatWatch 是「眼睛」（只读 + 记录 + 通知），这一层才是「嘴」。
+   * 走 `tools/dm-auto-reply.mjs`：规则全写死在脚本里，不靠模型临场发挥 ——
+   * 这是拿使用者账号对外说话，宁可回得朴素，也不能乱说。
+   *
+   * 与 atWatch 用同一套守护方式（长驻子进程 + 60 秒体检 + 连续失败就歇一轮），
+   * 区别只在 args：那边按 aweme 盯 @，这边按 dmToId 盯私信。
+   */
+  let dmProc = null
+  let dmProcSig = ''
+  let dmFailStreak = 0
+  const dmStateFile = join(stateDir, 'dm-auto-reply-state.json')
+  const dmLog = (s) => { try { appendFileSync(join(stateDir, 'dm-auto-reply.log'), `[${new Date().toISOString()}] ${s}\n`, 'utf8') } catch { /* 日志写不进就算了 */ } }
+  const dmWriteState = (patch) => {
+    try {
+      const cur = readJson(dmStateFile, {}) || {}
+      writeFileSync(dmStateFile, JSON.stringify({
+        ...cur, ...patch, ts: Date.now(),
+        on: Boolean(cfg.dmAuto),
+        sec: Math.max(30, Math.min(Number(cfg.dmAutoSec || 90), 3600)),
+        max: (() => {
+          const v = Number(cfg.dmAutoMax)
+          return v === 0 ? 0 : Math.max(1, Math.min(v || 5, 999))
+        })(),
+        max_note: Number(cfg.dmAutoMax) === 0 ? '不设上限' : '',
+        quiet: String(cfg.dmAutoQuiet || ''),
+        peer: String(cfg.dmTo || cfg.dmToId || ''),
+        pid: dmProc ? dmProc.pid : null,
+      }, null, 1), 'utf8')
+    } catch { /* 状态写不进也不能出事 */ }
+  }
+  const dmKill = () => {
+    if (!dmProc) return
+    try { dmProc.kill() } catch { /* 已经死了 */ }
+    dmProc = null
+    dmProcSig = ''
+  }
+  const dmEnsure = () => {
+    try {
+      refreshCfg()
+      if (!cfg.dmAuto) {
+        if (dmProc) { dmKill(); dmLog('开关关了 ⇒ 停掉自动回私信进程'); dmWriteState({ result: 'off' }) }
+        return
+      }
+      if (!hasCredential(stateDir)) { dmWriteState({ result: 'skip_no_login' }); return }
+      /**
+       * ⭐ 2026-10-25 晚改：`--peer` 不再是必需。
+       *
+       * 原来这里写死 `const peer = cfg.dmToId` + `if (!peer) return skip_no_peer`，
+       * 于是 dm-auto-reply.mjs 虽然早就支持「不给 --peer 就盯所有会话」，
+       * 但守护这层永远只传一个 peer ⇒ **别人发来的私信一律不看**，
+       * 表现就是「为什么还是回不了陌生人私信」。
+       *
+       * 现在两种模式并存：
+       *   · `dmScope === 'one'`  → 只盯 dmToId 那个人（老行为，保留给需要的人）
+       *   · `dmScope === 'all'`（默认）→ 不给 --peer，盯所有私聊会话
+       * dmScope 是 'one' 时才要求 peer 非空。
+       */
+      const scope = String(cfg.dmScope || 'all').trim() === 'one' ? 'one' : 'all'
+      const peer = String(cfg.dmToId || '').trim()
+      if (scope === 'one' && !peer) {
+        dmWriteState({ result: 'skip_no_peer', error: 'dmScope=one 但 dmToId 空着，不知道回谁' })
+        return
+      }
+      const sec = Math.max(30, Math.min(Number(cfg.dmAutoSec || 90), 3600))
+      /**
+       * max = 0 表示不设每天上限（2026-10-25 使用者要求）；非零时夹 1~999。
+       * quiet = 空串表示不静默、全天都回（inQuiet('') 天然返回 false）。
+       * 注意这里不能再写 `cfg.dmAutoQuiet || '01:00-08:00'` ——
+       * 空串是「使用者主动选的不静默」，用 || 会被兜回默认值，等于改了没用。
+       */
+      const maxRaw = Number(cfg.dmAutoMax)
+      const max = maxRaw === 0 ? 0 : Math.max(1, Math.min(maxRaw || 5, 999))
+      const quiet = String(cfg.dmAutoQuiet ?? '01:00-08:00').trim()
+      const owner = String(cfg.ownerUid || peer).trim()
+      /**
+       * ⭐ 视频卡片参数（2026-10-26）。跟着 dmAuto 一起下发 ——
+       * 这些键只影响自动回私信这条链路，单独在别处读没有意义。
+       */
+      const vOn = cfg.videoAuto !== false
+      const vEvery = Math.max(300, Number(cfg.videoEverySec) || 1800)
+      const vMaxRaw = Number(cfg.videoMax)
+      const vMax = vMaxRaw === 0 ? 0 : Math.max(0, Math.min(vMaxRaw || 3, 20))
+      const vReply = Math.max(0, Math.min(Number(cfg.videoReplyChance) || 0, 1))
+      const vIdle = Math.max(0, Math.min(Number(cfg.videoIdleChance) || 0, 1))
+      const sig = `${scope}|${peer}|${sec}|${max}|${quiet}|${owner}|v${vOn ? 1 : 0}:${vEvery}:${vMax}:${vReply}:${vIdle}`
+      if (dmProc && dmProcSig === sig) return          // 已经在跑且参数没变
+      if (dmProc) { dmKill(); dmLog('参数变了 ⇒ 重启自动回私信进程') }
+      const args = [join(pluginDir, 'tools', 'dm-auto-reply.mjs')]
+      if (scope === 'one') args.push('--peer', peer)
+      args.push('--max', String(max), '--every', String(sec))
+      /**
+       * ⭐ `--quiet` **必须无条件传**，哪怕值是空串。
+       *
+       * 🔴 2026-10-25 实测：原来写 `if (quiet) args.push('--quiet', quiet)`，
+       *    使用者把 `dmAutoQuiet` 设成 `''`（要求「夜间不静默、全天都回」）时，
+       *    空串为假 ⇒ 参数不传 ⇒ dm-auto-reply.mjs 回落到自己的默认
+       *    `argOf('--quiet', '01:00-08:00')` ⇒ **夜里 1 点到 8 点照样静默**，
+       *    改配置等于没改，而且日志里 quiet 会显示 `01:00-08:00` 露馅。
+       *    空串在脚本侧 `String(argOf(...)).trim()` 得到 `''`，
+       *    `inQuiet('')` 天然返回 false ⇒ 正确表示「不静默」。
+       */
+      args.push('--quiet', quiet)
+      if (owner) args.push('--owner-uid', owner)
+      /**
+       * ⭐ 视频卡片参数。`--video 0` 才关，其余数值全部无条件传 ——
+       * 和 `--quiet` 同一个道理：靠脚本自己的默认值兜底会让人以为改了配置却没用。
+       */
+      args.push('--video', vOn ? '1' : '0',
+        '--video-every', String(vEvery),
+        '--video-max', String(vMax),
+        '--video-reply', String(vReply),
+        '--video-idle', String(vIdle))
+      /**
+       * ⭐ 同 atWatch：必须用真 node.exe，不能用 Electron 的 process.execPath。
+       *    用 execPath 的话子进程立刻 code=0 退出，自动回私信永远跑不起来
+       *    （实测：日志每 60 秒 `已启动 → 进程退出（code=0）` 循环一整天）。
+       */
+      const dmRunner = nodeExe() || process.execPath
+      /**
+       * 🔴 2026-10-27 修「一条私信被回了两遍」：进程越堆越多。
+       *
+       * 原来的 exit 回调无条件 `dmProc = null` —— 但 kill 一个进程是异步的：
+       * `dmKill()` → 旧进程的 exit 事件晚到 → 那时 `dmProc` 已经指向**刚拉起的新进程**，
+       * 被这个迟到的回调抹成 null ⇒ 下一秒 dmEnsure 看到「没进程」又拉一个。
+       * 结果每一轮重启净增一个人：实测 08:48:52 与 08:49:52 各起一个，两个同时跑，
+       * 各自读到同一条待回私信、各自回一遍（日志 count 一次 10 → 11 跳着涨）。
+       *
+       * 修法：把 child 闭包进来，只有「当前引用还是我」才清空。
+       */
+      const dmChild = spawn(dmRunner, args, {
+        cwd: stateDir, env: { ...process.env, DOUYIN_HOME: stateDir, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', ...(nodeExe() ? {} : { ELECTRON_RUN_AS_NODE: '1' }) },
+        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      dmProc = dmChild
+      dmProcSig = sig
+      dmFailStreak = 0
+      try { dmChild.stdout.on('data', (b) => { const s = String(b || '').trim(); if (s) dmLog(s.slice(0, 400)) }) } catch { /* pipe 异常不影响 */ }
+      try { dmChild.stderr.on('data', (b) => { const s = String(b || '').trim(); if (s) dmLog(`[stderr] ${s.slice(0, 300)}`) }) } catch { /* 同上 */ }
+      dmChild.on('exit', (code) => {
+        dmLog(`自动回私信进程退出（code=${code}${dmProc === dmChild ? '' : '，非当前进程' }）`)
+        // 只有当前引用还是这个 child 才清空；否则会把「已经替换上去的新进程」抹掉
+        if (dmProc === dmChild) { dmProc = null; dmProcSig = '' }
+        if (code !== 0) dmFailStreak += 1
+        dmWriteState({ result: 'exited', exit_code: code })
+      })
+      dmLog(`自动回私信已启动：每 ${sec} 秒 / 每天最多 ${max} 条 / 静默 ${quiet || '无'} / 对象=${cfg.dmTo || peer}`)
+      dmWriteState({ result: 'started', error: '' })
+    } catch (e) {
+      dmFailStreak += 1
+      dmLog(`自动回私信没起来（第 ${dmFailStreak} 次）：${e?.message ?? e}`)
+      dmWriteState({ result: 'error', error: String(e?.message ?? e).slice(0, 160) })
+    }
+  }
+  try {
+    const dmT = setInterval(() => {
+      // 连续 3 次重启都失败 ⇒ 这一轮不硬拉（避免死循环重启把 CPU 打满）
+      if (dmFailStreak >= 3) { dmFailStreak = 0; dmLog('连续失败 3 次 ⇒ 跳过这次体检'); return }
+      dmEnsure()
+    }, 60_000)
+    dmT.unref?.()
+    ctx.effect(() => () => { clearInterval(dmT); dmKill() }, 'douyin-duty: 自动回私信进程')
+    dmEnsure()                                   // 启动时就来一次，别等 60 秒
+  } catch (e) { log(`自动回私信定时器没起来：${e?.message ?? e}`) }
+
+  /* ─────────────── ⭐ 自动回群聊（2026-10-27 使用者要求） ───────────────
+   * 原话：「没有被 @ 或被点名时回（默认），不做无差别接话，然后可以有 10% 的概率
+   *        去回复别人发的视频或者消息，群里发的视频要也抽帧看，所有群都监控，
+   *        没有回复上限，不要冷却」
+   *
+   * 为什么跟 dmAuto 分成两个进程而不是并进 dm-auto-reply.mjs：
+   *   ① dm-auto-reply 取会话时写死 `type === 1`（私聊），兼容群会把已经稳定的私聊链路改坏
+   *   ② 群的「谁在跟我说话」判据（@ / 点名）、发送路径（先点开群）都不一样
+   *   ③ 出问题能单独关：groupAuto=false 只停群聊，私聊照跑
+   *
+   * 与 dmAuto 一样用真 node.exe 拉子进程（用 Electron execPath 会立刻 code=0 退出），
+   * 并且用「child 闭包 + 只有当前引用还是我才清空」防越堆越多。
+   */
+  const groupStateFile = join(stateDir, 'group-reply-state.json')
+  const groupLog = (s) => { try { appendFileSync(join(stateDir, 'group-reply.log'), `[${new Date().toISOString()}] ${s}\n`, 'utf8') } catch { /* 日志写不进就算了 */ } }
+  let groupProc = null
+  let groupProcSig = ''
+  let groupFailStreak = 0
+  const groupKill = () => { const p = groupProc; groupProc = null; groupProcSig = ''; try { p?.kill() } catch { /* 已经退了 */ } }
+  const groupWriteState = (patch) => {
+    try {
+      const prev = readJson(groupStateFile, {})
+      writeJson(groupStateFile, {
+        ...prev, ...patch, ts: Date.now(),
+        on: Boolean(cfg.groupAuto),
+        sec: Math.max(60, Math.min(Number(cfg.groupAutoSec || 120), 3600)),
+        chance: Math.max(0, Math.min(Number(cfg.groupChance ?? 0.1), 1)),
+        frames: cfg.groupFrames !== false,
+      })
+    } catch { /* ignore */ }
+  }
+  const groupEnsure = () => {
+    try {
+      if (!cfg.groupAuto) {
+        if (groupProc) { groupKill(); groupLog('开关关了 ⇒ 停掉自动回群聊进程'); groupWriteState({ result: 'off' }) }
+        return
+      }
+      if (!hasCredential(stateDir)) {
+        groupWriteState({ result: 'skip_no_credential', error: '还没登录' })
+        return
+      }
+      const sec = Math.max(60, Math.min(Number(cfg.groupAutoSec || 120), 3600))
+      /**
+       * chance = 0.1 是使用者定的「10% 概率回别人的视频/消息」。
+       * 允许配 0（只回 @/点名）和 1（每条都想办法回）。
+       * frames 默认开 —— 使用者明确要求「群里发的视频要也抽帧看」。
+       */
+      const chance = Math.max(0, Math.min(Number(cfg.groupChance ?? 0.1), 1))
+      const frames = cfg.groupFrames !== false
+      const sig = `${sec}|${chance}|${frames ? 1 : 0}`
+      if (groupProc && groupProcSig === sig) return
+      if (groupProc) { groupKill(); groupLog('参数变了 ⇒ 重启自动回群聊进程') }
+      const args = [
+        join(pluginDir, 'tools', 'group-reply.mjs'),
+        '--every', String(sec),
+        '--chance', String(chance),
+        '--python', String(cfg.pythonPath || 'python'),
+      ]
+      if (!frames) args.push('--no-frames')
+      const runner = nodeExe() || process.execPath
+      const child = spawn(runner, args, {
+        cwd: stateDir,
+        env: { ...process.env, DOUYIN_HOME: stateDir, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', ...(nodeExe() ? {} : { ELECTRON_RUN_AS_NODE: '1' }) },
+        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      groupProc = child
+      groupProcSig = sig
+      groupFailStreak = 0
+      try { child.stdout.on('data', (b) => { const s = String(b || '').trim(); if (s) groupLog(s.slice(0, 500)) }) } catch { /* pipe 异常不影响 */ }
+      try { child.stderr.on('data', (b) => { const s = String(b || '').trim(); if (s) groupLog(`[stderr] ${s.slice(0, 300)}`) }) } catch { /* 同上 */ }
+      child.on('exit', (code) => {
+        groupLog(`自动回群聊进程退出（code=${code}${groupProc === child ? '' : '，非当前进程'}）`)
+        if (groupProc === child) { groupProc = null; groupProcSig = '' }
+        if (code !== 0) groupFailStreak += 1
+        groupWriteState({ result: 'exited', exit_code: code })
+      })
+      groupLog(`自动回群聊已启动：每 ${sec} 秒一轮 / 随机回概率 ${chance} / 抽帧 ${frames ? '开' : '关'}`)
+      groupWriteState({ result: 'started', error: '' })
+    } catch (e) {
+      groupFailStreak += 1
+      groupLog(`自动回群聊没起来（第 ${groupFailStreak} 次）：${e?.message ?? e}`)
+      groupWriteState({ result: 'error', error: String(e?.message ?? e).slice(0, 160) })
+    }
+  }
+  try {
+    const gT = setInterval(() => {
+      if (groupFailStreak >= 3) { groupFailStreak = 0; groupLog('连续失败 3 次 ⇒ 跳过这次体检'); return }
+      groupEnsure()
+    }, 60_000)
+    gT.unref?.()
+    ctx.effect(() => () => { clearInterval(gT); groupKill() }, 'douyin-duty: 自动回群聊进程')
+    groupEnsure()
+  } catch (e) { log(`自动回群聊定时器没起来：${e?.message ?? e}`) }
 
   /* ─────────────── ⭐ 桌宠（2026-10-24 v2：桌面级置顶窗口） ───────────────
    * 主人验收 0.4.0 后两条指令：①图裂了（素材在 layers/ 子目录 + 带空格层名，已修）；
@@ -3082,6 +3977,53 @@ export function apply(ctx, config) {
       report: reportFileOf(new Date()),
       version: myVersion(),
       cookieFile: cookiePath(stateDir),
+      /**
+       * ⭐ 盯 @ 的实时状态（2026-10-25）：开关、范围、进程在不在、上一拍结果。
+       *    使用者要判断「她到底有没有在自动回」，只看这一块就够。
+       */
+      atWatch: {
+        on: Boolean(cfg.atWatch),
+        running: Boolean(atProc),
+        pid: atProc ? atProc.pid : null,
+        sec: Math.max(30, Math.min(Number(cfg.atWatchSec || 120), 3600)),
+        max: Math.max(1, Math.min(Number(cfg.atWatchMax || 3), 20)),
+        scope: String(cfg.atWatchAweme || '').trim() || '全站',
+        owner_uid: String(cfg.ownerUid || '').trim() || '(未指定 ⇒ 特殊称呼对谁都不用)',
+        state: readJson(atStateFile, null),
+        log_tail: tail(join(stateDir, 'at-watch.log')).split('\n').filter(Boolean).slice(-6),
+      },
+      /**
+       * ⭐ 自动回私信的实时状态（2026-10-25）：开关、对象、进程在不在、上一拍结果。
+       *    使用者问过「私聊已读不回呢」⇒ 这块就是回答「现在到底会不会回」的地方。
+       */
+      dmAuto: {
+        on: Boolean(cfg.dmAuto),
+        running: Boolean(dmProc),
+        pid: dmProc ? dmProc.pid : null,
+        sec: Math.max(30, Math.min(Number(cfg.dmAutoSec || 90), 3600)),
+        max: (() => {
+          const v = Number(cfg.dmAutoMax)
+          return v === 0 ? 0 : Math.max(1, Math.min(v || 5, 999))
+        })(),
+        max_note: Number(cfg.dmAutoMax) === 0 ? '不设上限' : '',
+        quiet: String(cfg.dmAutoQuiet || ''),
+        peer: String(cfg.dmTo || '').trim() || '(未设置)',
+        peer_id: String(cfg.dmToId || '').trim() || '(未设置 ⇒ 不会回)',
+        owner_uid: String(cfg.ownerUid || '').trim() || '(未指定 ⇒ 特殊称呼对谁都不用)',
+        state: readJson(dmStateFile, null),
+        /**
+         * ⭐ 抖音风控需要人工过验证（2026-10-25 实测：私信页弹「依次点击文字」点选验证，
+         *    浮层盖住输入框，自动打字被吞）。到这一步插件**不自动过验证** ——
+         *    点错一次风控等级就往上跳。这里把「卡在哪一步」如实抬到面板上，
+         *    使用者打开浏览器点一下就恢复。
+         */
+        verify_needed: (() => {
+          const st0 = readJson(dmStateFile, null) || {}
+          const nv = st0.needVerify
+          return nv ? { ...nv, hint: '去这台机器的浏览器里,把抖音那个「依次点击文字」验证点掉,下一拍就自己恢复' } : null
+        })(),
+        log_tail: tail(join(stateDir, 'dm-auto-reply.log')).split('\n').filter(Boolean).slice(-6),
+      },
     }
   }
 

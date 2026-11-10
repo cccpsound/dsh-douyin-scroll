@@ -68,9 +68,25 @@ async function main() {
     })()`)
     await sleep(3500)
 
-    // 往下滚，让更多评论渲染出来
+    // 往下滚，让更多评论渲染出来。
+    // ⭐ 滚对容器（2026-10-25 实测血泪教训）：抖音页面的滚动容器不是 window，
+    //    而是 div.parent-route-container（实测 scrollTop:293 / scrollHeight:50037 / clientHeight:833）。
+    //    窗口是固定高度不全高，滚 window 永远滚不动 ⇒ 评论根本没往下加载，扫几屏都是空的。
+    //    所以这里直接拿那个容器改 scrollTop，不靠 mouseWheel 滚坐标。
+    const scroller = await ev(`(function(){
+      var sc = document.querySelector('.parent-route-container')
+            || document.querySelector('.route-scroll-container')
+            || document.scrollingElement || document.documentElement;
+      return JSON.stringify({ found: !!document.querySelector('.parent-route-container'), top: sc.scrollTop, sh: sc.scrollHeight, ch: sc.clientHeight });
+    })()`)
     for (let i = 0; i < SCROLLS; i++) {
-      await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 900, y: 700, deltaX: 0, deltaY: 800 })
+      await ev(`(function(){
+        var sc = document.querySelector('.parent-route-container')
+              || document.querySelector('.route-scroll-container')
+              || document.scrollingElement || document.documentElement;
+        sc.scrollTop += 800;
+        return sc.scrollTop;
+      })()`)
       await sleep(900)
     }
     await sleep(800)

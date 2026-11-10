@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { openPage, sleep } from '../lib/chrome.mjs'
+import { openPage, openFreshTab, sleep } from '../lib/chrome.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -37,6 +37,31 @@ const TOID = argOf('--to-id', '')
 const FILE = argOf('--file', '')
 const TEXT = argOf('--text', '')
 const DRY = argv.includes('--dry')
+/**
+ * 正文收长：上限 2000，超了在自然断点收尾并注明「后面还有 N 字」。
+ *
+ * 和 lib/desc.mjs 的 fitDesc / xj_douyin/desc_text.py 的 fit_desc 同一套规则。
+ * 为什么这里也要一份：这个文件是独立跑的 ESM 脚本，import 别处的导出要跨目录
+ * 解析，多一处依赖就多一处会因为路径改动而静默失效的地方。规则本身很短。
+ */
+const TEXT_CAP = 2000
+const _BREAKS = ['。', '！', '？', '；', '…', String.fromCharCode(10), '.', '!', '?', ';', '，', ',']
+function fitText(text, cap = TEXT_CAP) {
+  const s = text == null ? '' : String(text)
+  const limit = Math.max(20, Number(cap) || TEXT_CAP)
+  if (s.length <= limit) return s
+  // 往回找自然断点。只搜最后 30%，否则一条长文会一路退到第一个句号。
+  const floor = Math.floor(limit * 0.7)
+  let cut = -1
+  for (const br of _BREAKS) {
+    const i = s.lastIndexOf(br, limit - 1)
+    if (i >= floor && i > cut) cut = i
+  }
+  const head = cut > 0 ? s.slice(0, cut + 1) : s.slice(0, limit)
+  const rest = s.length - head.length
+  return rest > 0 ? `${head.trim()}（后面还有 ${rest} 字，这条没读完）` : head.trim()
+}
+
 const READ = argv.includes('--read')
 /** ⭐ --list：只列出会话里的人（昵称 + sec_uid），不发东西 */
 const LIST = argv.includes('--list')
@@ -68,14 +93,14 @@ const bodyText = async (ev) => (await ev(`(document.body?document.body.innerText
  */
 const readMessages = async (ev) => {
   const raw = await ev(`(function(){
-    var listNode = document.querySelector('[class*=主messageMessageList主]')
-      || document.querySelector('[class*=主componentsRightPanel主]') || document.body;
+    var listNode = document.querySelector('[class*="messageMessageList"]')
+      || document.querySelector('[class*="componentsRightPanel"]') || document.body;
     var lb = listNode.getBoundingClientRect();
     var mid = lb.left + lb.width / 2;
-    // ⚠️ 一条消息在 DOM 里有 3 层 class 都含 主messageMessageBox主（outer / selectableRow / contentBox），
+    // ⚠️ 一条消息在 DOM 里有 3 层 class 都含 "messageMessageBox"（outer / selectableRow / contentBox），
     //    直接 querySelectorAll 会**一条算三条** ⇒ 用 **对象引用** 去重（同一层消息被多个节点共享同一个
     //    message 对象）。别用位置去重：三层节点的 top 差几个像素，会漏掉。
-    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*=主messageMessageBox主]'));
+    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*="messageMessageBox"]'));
     var out = [], seenObj = new WeakSet();
     nodes.forEach(function(n){
       var fk = Object.keys(n).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
@@ -120,9 +145,40 @@ const readMessages = async (ev) => {
 }
 
 const hasEditor = async (ev) => await ev(`(function(){
-  var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable=主true主], textarea'));
+  var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'));
   return eds.some(function(e){var r=e.getBoundingClientRect(); return r.width>80 && r.height>10;});
 })()`)
+
+/**
+ * 右栏是不是僵死了（转圈转不出来）。
+ * 健康态：右栏有文字（对端昵称 + 消息）且有输入框；僵死态：右栏文本为空、只有 spinner。
+ */
+const chatPanelStuck = async (ev) => await ev(`(function(){
+  var rp = document.querySelector('[class*="componentsRightPanel"]');
+  var txt = rp ? (rp.innerText||'').trim() : '(no-panel-el)';
+  var eds = Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'))
+    .filter(function(e){var r=e.getBoundingClientRect(); return r.width>80 && r.height>10;}).length;
+  return JSON.stringify({ panel_empty: txt === '', panel_head: txt.slice(0,30), editors: eds });
+})()`)
+
+/**
+ * 在新开的标签页里把会话点开，然后确认输入框出现。
+ * 新页是全新 IM websocket，正常情况 3~9 秒内右栏就渲染出来了。
+ */
+async function hasEditorFresh(fresh, opened) {
+  try {
+    await sleep(3000)
+    // 新页需要重新点开那个人
+    const again = await openConversation(fresh.ev, fresh.send, TO, TOID)
+    for (let i = 0; i < 8; i++) {
+      await sleep(1200)
+      if (await hasEditor(fresh.ev)) return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
 
 /**
  * 列出会话列表里的每一项：昵称（显示用）+ **sec_uid（稳定 id）** + 点击坐标。
@@ -131,10 +187,11 @@ const hasEditor = async (ev) => await ev(`(function(){
  */
 const listConversations = (ev) => ev(`(function(){
   var out = [];
-  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e=主conversation-item主]'));
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e="conversation-item"]'));
   nodes.forEach(function(n){
     var fk = Object.keys(n).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
     var sec = '';
+    var peerUid = '';
     var unread = 0;
     if (fk) {
       var f = n[fk], d = 0;
@@ -142,6 +199,23 @@ const listConversations = (ev) => ev(`(function(){
         var p = f.memoizedProps;
         if (p && p.conversation && p.conversation.toParticipantSecUserId) {
           sec = String(p.conversation.toParticipantSecUserId);
+          /**
+           * ⭐ 2026-10-25：同一个会话在 fiber 里**同时带数字 uid**。
+           *    以前只取 sec_uid，导致 --to-id 传数字 uid 时永远匹配不到
+           *    （私信自动回复拿到的是 im-http 给的 peer_uid，是 16 位数字）。
+           *    字段名随版本可能变，几个候选都试一遍，取到第一个 10 位以上的数字串。
+           *    ⚠️ 这段在模板字符串里，注释中绝对不能出现反引号（会把模板提前闭合）。
+           */
+          var uCands = [
+            p.conversation.toParticipantUserId,
+            p.conversation.peerUserId,
+            p.conversation.toUserId,
+            p.conversation.userId,
+          ];
+          for (var ui = 0; ui < uCands.length; ui++) {
+            var uv = String(uCands[ui] || '').trim();
+            if (/^\\d{10,}$/.test(uv)) { peerUid = uv; break }
+          }
           // ⭐ 未读数：React fiber 里的 unreadCount 与 DOM 红点徽标**实测完全一致**（14/14 会话核过）。
           //    DOM 里也有 .ConversationItemUnReadCount 徽标，但 fiber 更稳（徽标会随滚动虚拟化消失）。
           unread = Number(p.conversation.unreadCount) || 0;
@@ -159,7 +233,7 @@ const listConversations = (ev) => ev(`(function(){
      *    用「大肥鱼」当收件人（没有任何人叫这个名字），会匹配到 3 个人。
      *    这里给两个候选：昵称元素里的文本 → 没有就退回第一段。
      */
-    var nickEl = n.querySelector('[class*=主ConversationItemTitle主], [class*=主conversationItemTitle主], [class*=主nickname主], [class*=主Nickname主]');
+    var nickEl = n.querySelector('[class*="ConversationItemTitle"], [class*="conversationItemTitle"], [class*="nickname"], [class*="Nickname"]');
     var nick = nickEl ? (nickEl.innerText || '').replace(/\\s+/g, ' ').trim() : '';
     if (!nick) nick = t.split(' ')[0] || '';
     /**
@@ -184,8 +258,31 @@ const listConversations = (ev) => ev(`(function(){
       if (/ConversationListwrapper/.test(bc)) { panel = 'main'; break }
       boxEl = boxEl.parentElement; dd++;
     }
+    /**
+     * ⭐ 2026-10-28：把「群」和「人」分开。
+     *    群会话在 fiber 里没有 toParticipantSecUserId（sec 恒空），但有
+     *    conversationType === 2 和 shortId。以前只报 sec_uid，调用方
+     *    只能看到空串、误以为是「读不到 id」，实际那是群、根本没有这个字段。
+     */
+    var ctype = 0;
+    var shortId = '';
+    if (fk) {
+      var f2 = n[fk], d2 = 0;
+      while (f2 && d2 < 14) {
+        var p2 = f2.memoizedProps;
+        if (p2 && p2.conversation && p2.conversation.conversationType !== undefined) {
+          ctype = Number(p2.conversation.conversationType || 0);
+          shortId = String(p2.conversation.shortId || '');
+          break;
+        }
+        f2 = f2.return; d2++;
+      }
+    }
     out.push({
       sec_uid: sec,
+      uid: peerUid,
+      type: ctype,
+      short_id: shortId,
       nick: nick.slice(0, 40),
       text: t.slice(0, 70),
       unread: unread,
@@ -214,7 +311,7 @@ const currentConvId = (ev) => ev(`(function(){
     for (var i = 0; i < cands.length; i++) if (cands[i]) return String(cands[i]);
     return '';
   }
-  var node = document.querySelector('[class*=主messageMessageBox主]') || document.querySelector('[data-e2e=主msg-item-content主]');
+  var node = document.querySelector('[class*="messageMessageBox"]') || document.querySelector('[data-e2e="msg-item-content"]');
   if (!node) return '';
   var fk = Object.keys(node).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
   if (!fk) return '';
@@ -222,6 +319,27 @@ const currentConvId = (ev) => ev(`(function(){
   while (f && d < 30) {
     var got = tp(f.memoizedProps);
     if (got) return got;
+    /**
+     * ⭐ 2026-10-28 修：只看 memoizedProps 时，点开私聊后经常读不到 toParticipantSecUserId
+     *    （实测 --to-id 传 sec_uid 却被判成「对端不是这个人」而中止）。
+     *    改成把 memoizedState 里挂着的 conversation 对象也翻一遍 —— fiber 的
+     *    hooks 链表会挂着同一个 conversation，字段一致但位置不同。
+     *    ⚠️ 只认 toParticipantSecUserId（sec_uid 那串 MS4wLjABAAAA…），
+     *       不碰数字 uid：数字 uid 群会话里也有，会造成串号。
+     */
+    if (f.memoizedState) {
+      var s = f.memoizedState, sd = 0;
+      while (s && sd < 40) {
+        var sp = s.memoizedState;
+        if (sp && typeof sp === 'object') {
+          var g = tp(sp);
+          if (!g && sp.conversation) g = tp({ conversation: sp.conversation });
+          if (!g && sp.current && sp.current.conversation) g = tp({ conversation: sp.current.conversation });
+          if (g) return String(g);
+        }
+        s = s.next; sd++;
+      }
+    }
     f = f.return; d++;
   }
   return '';
@@ -245,7 +363,7 @@ async function waitList(ev, { timeoutMs = 15000, settleMs = 600 } = {}) {
   let last = 0
   let stable = 0
   while (Date.now() - t0 < timeoutMs) {
-    const n = Number(await ev(`document.querySelectorAll('[data-e2e=主conversation-item主]').length`)) || 0
+    const n = Number(await ev(`document.querySelectorAll('[data-e2e="conversation-item"]').length`)) || 0
     if (n > 0) {
       // 拿到之后就等它主不再变多主，避免只渲染了一部分就往下走
       if (n === last) stable++
@@ -297,12 +415,12 @@ async function waitList(ev, { timeoutMs = 15000, settleMs = 600 } = {}) {
 async function openConversation(ev, send, who, whoId) {
   /**
    * ⭐ 判断主当前会话是不是就是他主要用**右栏头部**，不是 bodyText。
-   *    右栏头部 = `[class*=主componentsRightPanel主]` 的第一行文本，那才是对端昵称。
+   *    右栏头部 = `[class*="componentsRightPanel"]` 的第一行文本，那才是对端昵称。
    *    （bodyText 含左侧列表，任何人都在里面 —— 那正是 bug ① 的根源）
    */
   const currentWho = async () => {
     const nick = String(await ev(`(function(){
-      var r = document.querySelector('[class*=主componentsRightPanel主]');
+      var r = document.querySelector('[class*="componentsRightPanel"]');
       if (!r) return '';
       var lines = (r.innerText || '').split('\\n').map(function(s){return s.trim()}).filter(Boolean);
       return lines.length ? lines[0] : '';
@@ -315,8 +433,21 @@ async function openConversation(ev, send, who, whoId) {
     const cur = await currentWho()
     if (whoId) {
       if (cur.id && cur.id === whoId) return { status: 'already-open', matched: { sec_uid: cur.id, nick: who || cur.nick } }
-      if (!cur.id) return { status: 'unverifiable', matched: null, hint: '会话开着但读不到对端 id，不敢确认发给谁 —— 请关掉会话重试，或改用昵称' }
-      // 当前开着的是别人 ⇒ 继续往下走，去列表里点对的那个
+      /**
+       * 🔴 2026-10-28 修：读不到当前会话 id **不再直接放弃**，改成继续往下走。
+       *
+       * 原来的行为是 `return { status:'unverifiable', hint:'会话开着但读不到对端 id…' }`。
+       * 实测后果：dm-auto-reply 每 30 秒跑一轮、连续多轮全部 send_fail，
+       * 日志原文「会话开着但读不到对端 id，不敢确认发给谁」——
+       * 根因是右栏当时**开着的是群聊**（群没有 `toParticipantSecUserId`，
+       * `currentConvId` 只能返回空串），而群刚好被 group-reply 点开过。
+       * 也就是说：这个「读不到」不是因为危险，是因为那不是一个人。
+       *
+       * 继续往下走为什么安全：下面按 `whoId` 在列表里**精确**比对
+       * `sec_uid`/`uid`，找到才点，点完还要回读核实（`verify`）。
+       * 读不到当前会话 id 只是"不知道现在开着谁"，不影响"要点谁"。
+       */
+      cur.unverified = true
     } else if (who) {
       /**
        * ⭐ 只有昵称时的判据：右栏头部**精确等于**昵称才算已打开。
@@ -340,8 +471,13 @@ async function openConversation(ev, send, who, whoId) {
   /** 精确匹配不到时的兜底候选（只做提示，**不自动选**） */
   let nearMisses = []
   if (whoId) {
-    hits = list.filter((c) => c.sec_uid === whoId)
-    how = 'sec_uid'
+    /**
+     * ⭐ 2026-10-25：`--to-id` 现在**两种 id 都认** —— sec_uid（MS4wLjABAAAA…）与数字 uid（16 位）。
+     *    私信自动回复拿的是 im-http 给的 peer_uid（纯数字），而会话列表里以前只报 sec_uid，
+     *    于是 `--to-id 3787172659337272` 永远 not-found，报成「会话列表里没有昵称为「」的人」。
+     */
+    hits = list.filter((c) => c.sec_uid === whoId || (c.uid && c.uid === whoId))
+    how = list.some((c) => c.uid && c.uid === whoId) ? 'uid' : 'sec_uid'
   } else if (who) {
     /**
      * 🔴 三级匹配，**越往后越保守**（2026-10-23 重做）：
@@ -416,7 +552,7 @@ async function openConversation(ev, send, who, whoId) {
     const want = b.panel || 'main'
     // ① 切列表：目标在 main、但当前屏外 ⇒ 点「返回」箭头退出陌生人面板
     if (want === 'main') {
-      const hasStrangerTitle = await ev(`!!document.querySelector('[class*=主StrangerConversationListtitle主]')`)
+      const hasStrangerTitle = await ev(`!!document.querySelector('[class*="StrangerConversationListtitle"]')`)
       if (hasStrangerTitle) {
         const back = JSON.parse(String(await ev(`(function(){
           var best = null;
@@ -464,14 +600,14 @@ async function openConversation(ev, send, who, whoId) {
     const rescanned = JSON.parse(String(await ev(`(function(){
       var want = ${JSON.stringify(String(b.nick || ''))};
       var wantSec = ${JSON.stringify(String(b.sec_uid || ''))};
-      var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e=主conversation-item主]'));
+      var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e="conversation-item"]'));
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
         var keys = Object.keys(n), fk = null;
         for (var k = 0; k < keys.length; k++) if (keys[k].indexOf('__reactFiber$') === 0) { fk = keys[k]; break }
         var sec = '';
         if (fk) { var f = n[fk], d = 0; while (f && d < 14) { var p = f.memoizedProps; if (p && p.conversation && p.conversation.toParticipantSecUserId) { sec = String(p.conversation.toParticipantSecUserId); break } f = f.return; d++; } }
-        var nickEl = n.querySelector('[class*=主ConversationItemTitle主], [class*=主conversationItemTitle主], [class*=主nickname主], [class*=主Nickname主]');
+        var nickEl = n.querySelector('[class*="ConversationItemTitle"], [class*="conversationItemTitle"], [class*="nickname"], [class*="Nickname"]');
         var nk = nickEl ? (nickEl.innerText || '').replace(/\\s+/g, ' ').trim() : ((n.innerText || '').replace(/\\s+/g, ' ').trim().split(' ')[0] || '');
         if (wantSec ? sec !== wantSec : nk !== want) continue;
         var r = n.getBoundingClientRect();
@@ -549,7 +685,18 @@ async function main() {
           .replace(/^(昨天|前天|\d+月\d+日)\s*/, '')
           .slice(0, 50)
         return {
-          nick, sec_uid: x.sec_uid || '', preview, has_id: Boolean(x.sec_uid),
+          nick, sec_uid: x.sec_uid || '', uid: x.uid || '',
+          /**
+           * ⭐ 2026-10-28：把群/人分开标出来。
+           *    群会话在 fiber 里**没有** toParticipantSecUserId（`sec` 恒空），
+           *    以前只看 `has_id` 会以为"读不到 id 的人都不可靠"，其实是群本来就没这个字段。
+           *    `kind: 'group'` 时调用方应该走 group-send.mjs（按 shortId 点群），
+           *    而不是 im-send 的按 sec_uid 点人。
+           */
+          kind: String(x.type) === '2' ? 'group' : 'person',
+          conversation_type: Number(x.type) || 0,
+          short_id: String(x.shortId || ''),
+          preview, has_id: Boolean(x.sec_uid),
           /** ⭐ 未读条数：fiber 里的 unreadCount，实测与红点徽标 14/14 一致 */
           unread: Number(x.unread) || 0,
           /** ⚠️ 是否在可视区 —— false 的话点它没用（另一个列表被平移到屏外） */
@@ -585,8 +732,8 @@ async function main() {
     if (text.length > 1800) return out({ ok: false, error: `正文太长（${text.length} 字），抖音信信放不下，拆开发` })
   }
 
-  const c = await openPage({ url: 'https://www.douyin.com/chat' })
-  const chromed = c.status
+  let c = await openPage({ url: 'https://www.douyin.com/chat' })
+  let chromed = c.status
   try {
     // 确保停在 /chat
     const url = await c.ev('location.href')
@@ -620,7 +767,28 @@ async function main() {
         candidates: opened.candidates || [], chrome: chromed,
       })
     }
-    if (!(await hasEditor(c.ev))) return out({ ok: false, error: '会话没打开（找不到输入框）', opened, chrome: chromed })
+    /**
+     * ⭐ 右栏僵死自愈（2026-10-25 实测：抖音 /chat 用久了 IM 连接会挂，
+     *    左侧列表还在、右侧面板永远转圈，点会话也等不到输入框；reload 救不回来，
+     *    只有**开新标签页**才能恢复）。
+     *    所以这里不是直接报错，先换一个全新标签页重试一次。
+     */
+    if (!(await hasEditor(c.ev))) {
+      const stale = await chatPanelStuck(c.ev)
+      const fresh = await openFreshTab(c.port)
+      const stillBad = !(await hasEditorFresh(fresh, opened))
+      c.close()
+      c = fresh
+      chromed = 'fresh-tab'
+      if (stillBad) {
+        return out({
+          ok: false,
+          error: '会话没打开（找不到输入框）—— 换了新标签页也还是没有，可能是抖音那边把这个页面挡住了',
+          opened, stale_panel: stale, chrome: chromed,
+          hint: '过一会儿再试；或者手动在浏览器里点开这个会话看一眼是不是要验证码',
+        })
+      }
+    }
     const target = opened.matched || { sec_uid: TOID || '', nick: TO }
     /** 到底靠什么认的人：sec_uid / 昵称精确 / 昵称模糊 —— 如实带出去，别让调用方猜 */
     const matchedBy = opened.matched_by || (TOID ? 'sec_uid' : 'nickname(精确)')
@@ -641,7 +809,17 @@ async function main() {
         // 最新的在最后一条
         messages: ordered.slice(-60).map((m) => ({
           from: m.from,
-          text: String(m.text || '').slice(0, 160),
+          // 🔴 2026-11-08 修：原来切 160 字，长文案全被拦腰砍断。
+          //
+          // 事故：11-08 15:15 那条 426 字的随笔（「人生没有标准答案…敏感的人活在
+          // 这世上简直是个无敌倒霉」）进到她这儿只剩前 160 字，正好停在「恨不得把
+          // 脑子里整座荒原…」后面。她当时还说了句「不过你还有一截没说完哦」——
+          // 不是她没读懂，是她真的只拿到一截。
+          //
+          // 口径统一：私信正文 / 视频文案 / 转写都用同一个上限 2000，超了在自然断点
+          // 收尾并注明「后面还有 N 字」。抖音正文本身没有 2000 字那么长的，这个上限
+          // 实际等于不截，只是防一条畸形长文把整轮 prompt 撑爆。
+          text: fitText(String(m.text || '')),
           awe: m.awe || undefined,
           item: m.item || undefined,
         })),
@@ -659,7 +837,7 @@ async function main() {
      *    这一步很便宜（一次 evaluate），但它是主发错人主的最后一道闸。
      */
     const gateNick = String(await c.ev(`(function(){
-      var r = document.querySelector('[class*=主componentsRightPanel主]');
+      var r = document.querySelector('[class*="componentsRightPanel"]');
       if (!r) return '';
       var lines = (r.innerText || '').split('\\n').map(function(s){return s.trim()}).filter(Boolean);
       return lines.length ? lines[0] : '';
@@ -672,8 +850,45 @@ async function main() {
     }
 
     // 点输入框
+    /**
+     * 🔴 2026-10-25 实测：抖音会在**私信页**弹「点选文字」验证码
+     *    （rmc.bytedance.com/verifycenter/captcha/v2?from=iframe，实测 380×348 可见浮层，
+     *      提示「依次点击文字 楠 氛」）。验证码会盖住输入框，`Input.insertText` 打进去的文字
+     *      直接被吞 —— 表现是「正文没进输入框（可能被风控拦截）」，但真因是风控弹了验证。
+     *
+     *    这里**不自动过验证**（点错一次风控等级就往上跳，可能把号打成疑似机器）：
+     *    检测到就如实报出来，让使用者本人手动点一下。
+     */
+    const cap = JSON.parse(await c.ev(`(function(){
+      var out = { hit: false, w: 0, h: 0, kind: '', tip: '' };
+      var fs = document.querySelectorAll('iframe');
+      for (var i = 0; i < fs.length; i++) {
+        var f = fs[i]; var src = String(f.src || '');
+        if (!/verifycenter|captcha|nocaptcha|rmc\\.bytedance/i.test(src)) continue;
+        var r = f.getBoundingClientRect();
+        // 0×0 / display:none 的那种是常驻的空壳，不算
+        if (r.width < 40 || r.height < 40) continue;
+        out.hit = true; out.w = Math.round(r.width); out.h = Math.round(r.height);
+        out.kind = /captcha\\/v2/.test(src) ? '点选文字/滑块' : '风控壳';
+        try {
+          var d = f.contentDocument;
+          if (d) out.tip = String((d.body && d.body.innerText) || '').replace(/\\s+/g, ' ').slice(0, 80);
+        } catch (e) { /* 跨域读不到，正常 */ }
+        break;
+      }
+      return JSON.stringify(out);
+    })()`))
+    if (cap.hit) {
+      return out({
+        ok: false, sent: false,
+        error: `抖音弹了验证（${cap.kind}${cap.tip ? '：' + cap.tip : ''}）—— 输入框被挡住，这条没发出去`,
+        captcha: cap,
+        hint: '要本人在这台机器的浏览器里点一下验证（这一步不做自动化：点错会把号的风控等级升上去）',
+        chrome: chromed,
+      })
+    }
     const pos = JSON.parse(await c.ev(`(function(){
-      var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable=主true主], textarea'));
+      var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'));
       for (var i=0;i<eds.length;i++){var e=eds[i];var r=e.getBoundingClientRect();if(r.width>80&&r.height>10)return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});}
       return '{}';
     })()`))
@@ -684,7 +899,7 @@ async function main() {
     await sleep(800)
 
     const typed = await c.ev(`(function(){
-      var e=document.querySelector('[contenteditable=主true主], textarea');
+      var e=document.querySelector('[contenteditable="true"], textarea');
       return e ? String(e.innerText||e.value||'').replace(/[\\u200b\\r]/g,'') : '';
     })()`)
     if (!String(typed).trim()) return out({ ok: false, error: '正文没进输入框（可能被风控拦截）', chrome: chromed })
@@ -695,7 +910,7 @@ async function main() {
 
     const bodyNow = await bodyText(c.ev)
     const leftInBox = await c.ev(`(function(){
-      var e=document.querySelector('[contenteditable=主true主], textarea');
+      var e=document.querySelector('[contenteditable="true"], textarea');
       return (e?String(e.innerText||e.value||''):'').replace(/[\\u200b\\s]/g,'').length;
     })()`)
     // ⭐ 第 ③ 步：**回读消息列表**，而且只数 `from === 'me'` 的

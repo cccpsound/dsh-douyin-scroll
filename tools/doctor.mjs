@@ -18,11 +18,15 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 
 import { homeDir, pluginDir, cookieFile, runtimeFile, profileDir } from '../lib/paths.mjs'
 import { findBrowser, chromeDoctor } from '../lib/chrome.mjs'
 
 const asJson = process.argv.includes('--json')
+/* jsdom 要在插件目录再 resolve 一次：两处都没有才算真没有 */
+let pdirForJsdom = ''
+try { pdirForJsdom = pluginDir() } catch { pdirForJsdom = process.cwd() }
 const items = []
 const row = (item, state, detail = '', fix = '') => items.push({ item, state, detail, fix })
 
@@ -42,8 +46,15 @@ if (major >= 22) row('Node', 'ok', nodeVer)
 else row('Node', 'bad', `${nodeVer}（需要 ≥22）`, '升级 Node 到 22 或更新')
 
 /* ── 3. Python（只是其中一项，缺了不影响别的） ── */
-const pyCmd = process.platform === 'win32' ? 'python' : 'python3'
-const pyProbe = spawnSync(pyCmd, ['--version'], { encoding: 'utf8' })
+/* ⚠ Windows 上裸 `python` 的 PE Subsystem = 3(Console)，spawn 出来会弹黑框。
+   venv 里的 pythonw.exe(Subsystem=2) 完全能 `--version`，优先用它 —— 见 lib/quiet.mjs 的说明。 */
+const pyCmd = (() => {
+  if (process.platform !== 'win32') return 'python3'
+  const w = home ? join(home, '.venv', 'Scripts', 'pythonw.exe') : ''
+  if (w && existsSync(w)) return w
+  return 'python'
+})()
+const pyProbe = spawnSync(pyCmd, ['--version'], { encoding: 'utf8', windowsHide: true })
 if (pyProbe.status === 0) {
   row('Python', 'ok', String(pyProbe.stdout || pyProbe.stderr || '').trim())
 } else {
@@ -53,7 +64,7 @@ if (pyProbe.status === 0) {
 
 /* ── 4. venv（装依赖之后才有） ── */
 if (home) {
-  const venvPy = join(home, '.venv', 'Scripts', 'python.exe')
+  const venvPy = join(home, '.venv', 'Scripts', process.platform === 'win32' ? 'pythonw.exe' : 'python')
   const venvPyNix = join(home, '.venv', 'bin', 'python')
   if (existsSync(venvPy) || existsSync(venvPyNix)) {
     row('主依赖 venv', 'ok', existsSync(venvPy) ? venvPy : venvPyNix)
@@ -97,7 +108,56 @@ const missing = need.filter((f) => !existsSync(join(pdir, f)))
 if (missing.length) row('关键文件', 'bad', '缺 ' + missing.join(', '), '重新安装插件包')
 else row('关键文件', 'ok', `${need.length} 个都在`)
 
-/* ── 9. 人设（顺手报一下用的是哪层） ── */
+/* ── 9. 签名链路（jsdom + signer/sdk/） ──
+ * 2026-10-25 为什么要加这两项：之前 doctor 报「全绿」，但 signer/sdk/ 整个目录
+ * 不存在、jsdom 也没装 ⇒ api-comments.py 跑起来直接 KeyError: 'signedUrl'。
+ * 人会以为「体检过了，肯定是抖音那边的问题」。假绿比不报更糟。
+ *
+ * 为什么用 warn 不用 bad：签名不是跑值班的前提。发卡片 / 发私信 / 读通知全走
+ * 浏览器或纯 HTTP，缺了签名只是「读评论 / 按接口发评论」这两条不通。把影响的
+ * 边界说清楚，比一刀切标红有用。
+ * ── */
+if (home) {
+  const signerDir = process.env.DY_SIGNER_DIR || join(home, 'signer')
+  const sdkDir = join(signerDir, 'sdk')
+  /* 与 dy-signer.mjs 顶部的 ORDER 保持一致（顺序就是加载顺序，不能乱） */
+  const SDK_FILES = ['webmssdk.js', 'secsdk-runtime.js', 'sdk-glue.js',
+    'bdms-signer.js', 'slardar.js', 'captcha-sdk.js', 'verifycenter.js']
+  const haveSdk = SDK_FILES.filter((f) => existsSync(join(sdkDir, f)))
+  const lackSdk = SDK_FILES.filter((f) => !existsSync(join(sdkDir, f)))
+
+  if (haveSdk.length === SDK_FILES.length) {
+    row('签名 SDK', 'ok', `${sdkDir}（${SDK_FILES.length}/${SDK_FILES.length}）`)
+  } else if (haveSdk.length === 0) {
+    row('签名 SDK', 'warn', `没有（${sdkDir} 不存在或是空的）`,
+      '不影响发卡片 / 发私信 / 读通知；但「读评论」「按接口发评论」会报 KeyError: signedUrl。要用就把那 7 个 js 放进 $DOUYIN_HOME/signer/sdk/')
+  } else {
+    row('签名 SDK', 'warn', `只有 ${haveSdk.length}/${SDK_FILES.length}，缺 ${lackSdk.join(', ')}`,
+      '缺任一个都签不出来（dy-signer.mjs 对缺失只 console.log 不报错）')
+  }
+
+  /* jsdom：dy-signer.mjs 第 28 行就是 require('jsdom')，没它连脚本都加载不了 */
+  let jsdomOk = false
+  let jsdomWhere = ''
+  try {
+    createRequire(join(signerDir, 'noop.js')).resolve('jsdom')
+    jsdomOk = true
+    jsdomWhere = '（从 $DOUYIN_HOME/signer 能解析到）'
+  } catch {
+    try {
+      createRequire(join(pdirForJsdom, 'noop.js')).resolve('jsdom')
+      jsdomOk = true
+      jsdomWhere = '（只在插件目录里找到，dy-signer 从 signer 目录解析，可能还是找不到）'
+    } catch {
+      jsdomOk = false
+    }
+  }
+  if (jsdomOk) row('jsdom', 'ok', '已安装' + jsdomWhere)
+  else row('jsdom', 'warn', '没安装',
+    '签名器跑不起来（Error: Cannot find module \'jsdom\'）。装它：cd $DOUYIN_HOME/signer && npm i jsdom')
+}
+
+/* ── 10. 人设（顺手报一下用的是哪层） ── */
 if (home) {
   const mine = join(home, 'persona.md')
   if (existsSync(mine)) row('人设', 'ok', '用你自己写的那份（$DOUYIN_HOME/persona.md）')

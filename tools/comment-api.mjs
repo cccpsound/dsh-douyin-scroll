@@ -32,7 +32,7 @@
  * 输出一行 JSON：{ ok, http, cid, reply_to, root, text, raw?, error? }
  */
 import { readFileSync } from 'node:fs'
-import { openPage, sleep } from '../lib/chrome.mjs'
+import { openIsolatedTab, ensureChrome, sleep } from '../lib/chrome.mjs'
 
 const argv = process.argv.slice(2)
 const argOf = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? (argv[i + 1] ?? d) : d }
@@ -76,8 +76,23 @@ if (wantsMention) {
 }
 
 try {
-  const c = await openPage()
+  /**
+   * 🔴 2026-11-10：**不借 `/chat` 页**。
+   * 它只要求「站在 douyin.com 上」好让相对路径 fetch 带上 cookie 和页面签名器，
+   * 根本不需要那个页的会话状态。借了它再 `Page.navigate` 会把 CDP Target 换掉，
+   * 正在用 `/chat` 的 `look-video` / `dm-auto-reply` 当场 ws 断连
+   * （日志里的 `CDP WebSocket 已断开，无法发送 Runtime.evaluate` 就是这么来的）。
+   * 自己开一个页，用完 dispose。
+   */
+  const { port: _cp } = await ensureChrome({ url: 'https://www.douyin.com/chat' })
+  const c = await openIsolatedTab(_cp, 'https://www.douyin.com/')
   const chromed = c.status
+  /**
+   * 这个脚本里有十几个 `process.exit()`（参数校验、拿不到 cid、发表失败…），
+   * 逐个补 dispose 容易漏。挂在 exit 上一次性兜住：无论如何退出，
+   * 自己开的那一页都会被关掉，不会在浏览器里堆。
+   */
+  process.on('exit', () => { try { c.dispose && c.dispose() } catch { /* 已经关了 */ } })
 
   // 必须站在 douyin.com 上，相对路径 fetch 才带得上 cookie / 页面签名器
   const cur = String(await c.ev('location.href'))
@@ -105,10 +120,32 @@ try {
       os_name:'Windows', os_version:'10', platform:'PC'
     };
     function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
+    /**
+     * ⭐ 2026-10-25 修：页面内 fetch 必须自带超时。
+     *
+     * 原来这里没有超时 —— 抖音在风控/审核态下对某些请求会一直不回，
+     * 页面里的 await 就永远挂着，CDP 那侧 awaitPromise=true 也永远等不到，
+     * 整个 comment-api 卡死（实测卡满 240 秒被外层 kill，只剩 error:"unknown"）。
+     *
+     * 🔴 关键：AbortController 在这里救不了场。
+     *   实测 /comment/list/reply/ 会回一个「200 + body 永不结束」的响应，
+     *   abort() 只对「还没拿到响应头」有效，对「响应体流不关」无效 ——
+     *   await r.text() 照样无限等。
+     *   ⇒ 必须用 Promise.race 让这个 await 直接输掉竞速，往下走。
+     *
+     * 注意：这段是模板字符串里的代码，注释里**不能出现反引号**（会提前闭合模板）。
+     */
+    var race = function(p, ms, tag){
+      return Promise.race([p, new Promise(function(_, rej){
+        setTimeout(function(){ rej(new Error('timeout:' + tag)) }, ms);
+      })]);
+    };
     async function get(rel){
-      var r = await fetch(rel, { credentials:'include', headers:{ accept:'application/json' } });
-      var t = await r.text();
-      try { return JSON.parse(t) } catch(e) { return null }
+      try {
+        var r = await race(fetch(rel, { credentials:'include', headers:{ accept:'application/json' } }), 8000, 'head');
+        var t = await race(r.text(), 8000, 'body');
+        try { return JSON.parse(t) } catch(e) { return null }
+      } catch(e) { return null }
     }
     // 不给 --reply = 发顶层评论，不需要判楼
     if (!TARGET) return JSON.stringify({ ok:true, root:'', reply_to:'', how:'top-level' });
@@ -119,12 +156,56 @@ try {
       return JSON.stringify({ ok:true, root:ROOTIN, reply_to:rp, how:'explicit' });
     }
 
-    // ② 翻顶层列表找 TARGET：确定它是 level1 还是 level2
-    var cursor = 0, pages = 0;
-    while (pages < 8) {
+    // ② ⭐ 先用 insert_ids 定向取 —— 比翻页可靠得多（2026-10-25 加）
+    /**
+     * 为什么把这一步提到翻页前面：
+     *   · 通知里给的 cid 是「刚 @ 我」的那条，热度 0，翻 4 页也未必撞见；
+     *   · /comment/list/?insert_ids=<cid> 是定向取，服务端会把这条单独插进返回
+     *     （审核中的也读得到，实测 status=7 时也能拿回 nick/uid/text）；
+     *   · 一次请求就能知道它是 level1 还是 level2（level 字段），比翻页+reply 探测快且准。
+     *
+     * 🔴 踩过的坑：insert_ids 是「插入」不是「过滤」—— 返回里照样带整页别的评论，
+     *    所以必须自己按 cid 精确比对，不能拿 comments[0] 当答案。
+     * ⚠️ 本段处于模板字符串内，注释里不能出现反引号。
+     */
+    var probe = await get('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
+      aweme_id: AWEME, count: '20', cursor: '0', item_type: '0', insert_ids: TARGET
+    })));
+    if (probe && probe.comments) {
+      for (var pi = 0; pi < probe.comments.length; pi++) {
+        var pc = probe.comments[pi];
+        if (String(pc.cid) !== TARGET) continue;
+        // 找到了这条它自己
+        if (pc.level === 1 || pc.level === undefined || pc.reply_id === '0' || !pc.reply_id) {
+          // 顶层评论（自己就是楼根）
+          return JSON.stringify({ ok:true, root:TARGET, reply_to:'', how:'insert-ids-level1',
+            probe_status: Number(pc.status) || 0 });
+        }
+        // level 2 ⇒ 它在某栋楼里，reply_id 就是楼根
+        var pr = String(pc.reply_id || '');
+        if (pr && pr !== '0') {
+          return JSON.stringify({ ok:true, root:pr, reply_to:TARGET, how:'insert-ids-level2',
+            probe_status: Number(pc.status) || 0 });
+        }
+      }
+    }
+
+    // ③ 翻顶层列表找 TARGET：确定它是 level1 还是 level2
+    /**
+     * 🔴 2026-10-25：翻页上限 8 → **4**，并加总预算。
+     *
+     * 为什么：通知里给的 cid 往往是**刚发的**，热度 0，排在很后面；翻 8 页 × 每页最多 8 秒
+     * = 最坏 64 秒，加上后面还要发评、回读 3 次，整条链路必然超 CDP 的 90 秒。
+     * 而实测「刚 @ 我的那条」多数就在前 2 页（通知是按时间来的，评论刚建）。
+     * 翻不到就走 ④ 的 reply 探测兜底 —— 那条只打一次请求，比翻页可靠。
+     */
+    var cursor = 0, pages = 0, spent = 0;
+    while (pages < 4 && spent < 22000) {
+      var t0 = Date.now();
       var j = await get('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
         aweme_id: AWEME, count: '20', cursor: String(cursor), item_type: '0'
       })));
+      spent += Date.now() - t0;
       if (!j) break;
       var cs = j.comments || [];
       for (var i = 0; i < cs.length; i++) {
@@ -169,6 +250,14 @@ try {
     await sleep(200)
     out({
       ok: false,
+      /**
+       * 🔴 2026-10-27 加：把「判不出楼根」这个**具体原因**传给调用方。
+       *
+       * 原来只给一句 error 文本，上层 at-me-watch 分不清「接口抽风」和
+       * 「这条评论的楼根本身已经不存在了」—— 前者重试有意义，后者重试一万次也一样。
+       * 带上 need_root 之后上层才能决定退避多久、要不要直接放弃。
+       */
+      need_root: Boolean(plan.need_root),
       error: plan.hint || '判不出楼根，已中止（不瞎猜）',
       aweme_id: AWEME,
       reply_to: REPLY,
@@ -206,6 +295,12 @@ try {
       os_name:'Windows', os_version:'10', platform:'PC'
     };
     function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
+    // 这段是**另一个** Runtime.evaluate，不共享 resolveJs 里的 race ⇒ 这里必须自己定义一份。
+    var race = function(p, ms, tag){
+      return Promise.race([p, new Promise(function(_, rej){
+        setTimeout(function(){ rej(new Error('timeout:' + tag)) }, ms);
+      })]);
+    };
     var url = '/aweme/v1/web/comment/publish/?' + qs(Object.assign({}, COMMON, { app_name:'aweme' }));
     var body = Object.assign({}, COMMON, {
       aweme_id: AWEME, text: TEXT, text_extra: '[]',
@@ -220,12 +315,13 @@ try {
     }
     var o = { http: 0, cid: '', status_code: null, head: '' };
     try {
-      var r = await fetch(url, {
+      // 同 get()：发布请求也要自带超时（用 race，AbortController 对「body 不结束」无效）。
+      var r = await race(fetch(url, {
         method: 'POST', credentials: 'include',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': 'https://www.douyin.com/' },
-        body: new URLSearchParams(body).toString()
-      });
-      var txt = await r.text();
+        body: new URLSearchParams(body).toString(),
+      }), 25000, 'publish-head');
+      var txt = await race(r.text(), 15000, 'publish-body');
       o.http = r.status;
       o.head = txt.slice(0, 240);
       // ⚠️ 必须在页面里就解析：整包可能好几 KB，截断后 Node 那边 JSON.parse 会失败（踩过）
@@ -249,12 +345,25 @@ try {
      *   · 顶楼里读不到、但顶层列表里有它 ⇒ 它变成了一条独立顶层评论（**楼根填错了**）
      * 重读要等页面刷新一会儿，所以带 3 次重试。
      */
+    /**
+     * 重读用的 fetch 也要带超时（同 get()）。
+     * 这一整段原先是裸 fetch —— 页面卡住时 await 不返回，CDP awaitPromise 就无限等。
+     * ⚠️ 同样不能用 AbortController：reply/list 会回「200 + body 永不结束」，
+     *    只有 Promise.race 能让它输掉竞速。返回空串表示这次读不到。
+     */
+    var rget = async function(u){
+      try {
+        var rr = await race(fetch(u, { credentials:'include', headers:{ accept:'application/json' } }), 8000, 'rb-head');
+        var tt = await race(rr.text(), 8000, 'rb-body');
+        return tt;
+      } catch(e) { return ''; }
+    };
     if (o.cid && ROOT) {
       for (var attempt = 1; attempt <= 3; attempt++) {
         await new Promise(function(z){ setTimeout(z, attempt === 1 ? 1200 : 1800) });
-        var rj = await fetch('/aweme/v1/web/comment/list/reply/?' + qs(Object.assign({}, COMMON, {
+        var rj = await rget('/aweme/v1/web/comment/list/reply/?' + qs(Object.assign({}, COMMON, {
           item_id: AWEME, comment_id: ROOT, cursor: '0', count: '20', item_type: '0'
-        })), { credentials: 'include', headers: { accept: 'application/json' } }).then(function(x){ return x.text() }).catch(function(){ return '' });
+        })));
         var rjj = null; try { rjj = JSON.parse(rj) } catch(e) {}
         if (rjj && rjj.comments) {
           for (var i2 = 0; i2 < rjj.comments.length; i2++) {
@@ -271,15 +380,48 @@ try {
       }
       if (!o.verified) {
         // 楼里没有 ⇒ 去看看它是不是跑到顶层列表去了
-        var tl = await fetch('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
+        var tl = await rget('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
           aweme_id: AWEME, count: '20', cursor: '0', item_type: '0'
-        })), { credentials: 'include', headers: { accept: 'application/json' } }).then(function(x){ return x.text() }).catch(function(){ return '' });
+        })));
         var tjj = null; try { tjj = JSON.parse(tl) } catch(e) {}
         if (tjj && tjj.comments) {
           for (var k2 = 0; k2 < tjj.comments.length; k2++) {
             if (String(tjj.comments[k2].cid) === o.cid) { o.found_at_top = true; break; }
           }
         }
+      }
+    }
+    /**
+     * ⭐⭐⭐ 按 cid 精确回读（2026-10-25 加，这是判断「到底发没发出去」的唯一硬证据）
+     *
+     * 为什么不能用普通的 /comment/list/ 找自己那条：
+     *   抖音把新评论先扔进审核队列（comment.status = 7），**审核中的不出现在列表里**。
+     *   翻多少页都读不到 ⇒ 一律被误判成「没发出去」。
+     *
+     * insert_ids 是定向取：带上 cid，服务端把这几条单独插进返回，审核中也读得到。
+     * 实测：status=7 时能读到 nick/uid/text 全对，只是别人看不见。
+     */
+    if (o.cid) {
+      for (var rdy = 1; rdy <= 3; rdy++) {
+        await new Promise(function(z){ setTimeout(z, rdy === 1 ? 900 : 1500) });
+        var ir = await rget('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
+          aweme_id: AWEME, count: '20', cursor: '0', item_type: '0', insert_ids: o.cid
+        })));
+        var ij = null; try { ij = JSON.parse(ir) } catch (e3) {}
+        if (ij && ij.comments) {
+          for (var q = 0; q < ij.comments.length; q++) {
+            if (String(ij.comments[q].cid) === o.cid) {
+              o.readback = true;
+              o.readback_status = Number(ij.comments[q].status) || 0;
+              o.readback_text = String(ij.comments[q].text || '');
+              o.readback_nick = String((ij.comments[q].user && ij.comments[q].user.nickname) || '');
+              o.readback_uid = String((ij.comments[q].user && ij.comments[q].user.uid) || '');
+              o.readback_level = ij.comments[q].level;
+              break;
+            }
+          }
+        }
+        if (o.readback) break;
       }
     }
     return JSON.stringify(o);
@@ -294,6 +436,25 @@ try {
 
   const cid = String(res.cid || '')
   const ok = res.http === 200 && !!cid
+
+  /**
+   * 发布状态（2026-10-25 实测校正后，与 comment-read-page.mjs 保持一致）：
+   *   接口 200 + 有 cid 只代表**服务端收下了**。
+   *
+   *   实测某视频 870 条顶层评论，本人（小鲸鱼）发的 6 条全在列表里，
+   *   status 分布是别人的评论一律 1，自己新发的才是 3/2 —— 而截图显示
+   *   「这狗一看就是被惯坏的…刚刚」明明就挂在评论区最顶上（status=3）。
+   *
+   *   ⇒ status=3/2 都是**正常可见**（只是被标成「新提交」），
+   *     只有 status=7 才是真的「审核中、别人暂时看不到」。
+   *
+   *   之前写「只有 1 才是 published」是错的：把 3/2 当成失败，
+   *   于是「评论好好地在评论区里」被报成「没发出去」。别再退回去。
+   */
+  const rbStatus = res.readback_status === undefined || res.readback_status === null
+    ? null : Number(res.readback_status)
+  const publishState = rbStatus === null ? 'unknown'
+    : (rbStatus === 7 ? 'pending' : 'published')
 
   /**
    * ⭐⭐ 落位判据（2026-10-23 定稿）：
@@ -331,7 +492,15 @@ try {
   out({
     ok,
     http: res.http,
-    cid: cid || undefined,
+    cid,
+    publish_state: publishState,
+    readback_status: rbStatus,
+    readback_nick: res.readback_nick || undefined,
+    readback_uid: res.readback_uid || undefined,
+    pending_hint: publishState === 'pending'
+      ? `评论已提交（status=${rbStatus}），但评论区列表里现在刷不到 —— 抖音还没放出来。`
+        + '别跟人说「已经发在评论区了」；过几分钟用 comment-read-page.mjs --ids 再查。'
+      : undefined,
     reply_to: plan.reply_to || '(顶层评论)',
     root: plan.root || undefined,
     resolved_by: plan.how,

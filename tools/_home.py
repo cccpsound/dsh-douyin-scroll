@@ -47,4 +47,22 @@ def plugin_dir() -> Path:
 
 
 def node_bin() -> str:
-    return os.environ.get("DOUYIN_NODE") or "node"
+    """跑 node 用哪个 exe。
+
+    Windows 上裸 ``node`` 在 PATH 里解析到的是 WinGet 那份 node.exe，
+    PE Subsystem = 3(Console)。父进程（AstrBot 的 pythonw.exe / DSH 的
+    Electron）自己没有控制台可继承，子进程就会新建一个控制台窗口，
+    屏幕上直接出现标题为 exe 完整路径的黑框 —— 2026-10-29 使用者反馈
+    「打游戏被强行退出」。``windowsHide`` / ``CREATE_NO_WINDOW`` 都被
+    Win11 的 Windows Terminal 托管顶掉。
+
+    ``E:\\_bot\\bin\\nodew.exe`` 是同一份 node 的副本，只把 PE 头 0x5C 处的
+    Subsystem 字节 3 改成 2，功能完全一样但压根不申请控制台。
+    """
+    explicit = os.environ.get("DOUYIN_NODE")
+    if explicit:
+        return explicit
+    quiet = r"E:\_bot\bin\nodew.exe"
+    if os.path.exists(quiet):
+        return quiet
+    return "node"

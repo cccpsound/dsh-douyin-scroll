@@ -361,30 +361,90 @@ try {
     throw { __done: true }
   }
 
-  // ⑥ 点右下角红色箭头发布（svg 里 fill=FE2C55，往上找到 ≥24px 的可点容器）
-  const btn = JSON.parse(await c.ev(`(function(){
+  /**
+   * ⑥ 点右下角红色箭头发布（svg 里 fill=FE2C55，往上找到 ≥24px 的可点容器）
+   *
+   * 🔴 2026-10-25 实测修的两个坑（原来这里一定点空）：
+   *   ① **按钮可能落在视口外**。实测 dump：输入容器 rect y=801..872，
+   *      而 window.innerHeight 只有 805 —— 按钮中心 y=806，**差 1 像素点不到**。
+   *      真实鼠标事件打不到视口外的坐标，于是点了等于没点。
+   *      ⇒ 点之前必须先把按钮本身 scrollIntoView，用**滚动后重新量的 rect**。
+   *   ② 不能只 `scrollIntoView` 就立刻取坐标：平滑滚动是异步的，
+   *      同一帧里量到的还是旧位置。⇒ 滚完 sleep 再量一次。
+   */
+  await c.ev(`(function(){
     var root=document.getElementById('comment-input-container');
-    if(!root) return '{}';
+    if(!root) return 'no-root';
     var svgs=root.querySelectorAll('svg');
     for (var i=0;i<svgs.length;i++){
       if (String(svgs[i].innerHTML||'').indexOf('FE2C55')<0) continue;
       var e=svgs[i];
       for (var up=0; up<4 && e; up++){
         var r=e.getBoundingClientRect();
-        if (r.width>24 && r.height>24) return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});
+        if (r.width>24 && r.height>24) { e.scrollIntoView({block:'center', inline:'center'}); return 'scrolled'; }
+        e=e.parentElement;
+      }
+    }
+    return 'not-found';
+  })()`)
+  await sleep(900)   // 等平滑滚动落定，否则量到的是旧位置
+
+  const btn = JSON.parse(await c.ev(`(function(){
+    var root=document.getElementById('comment-input-container');
+    if(!root) return '{}';
+    var vh = window.innerHeight, vw = window.innerWidth;
+    var svgs=root.querySelectorAll('svg');
+    for (var i=0;i<svgs.length;i++){
+      if (String(svgs[i].innerHTML||'').indexOf('FE2C55')<0) continue;
+      var e=svgs[i];
+      for (var up=0; up<4 && e; up++){
+        var r=e.getBoundingClientRect();
+        if (r.width>24 && r.height>24) {
+          var cx=Math.round(r.x+r.width/2), cy=Math.round(r.y+r.height/2);
+          /* 把实际坐标和视口一起报出来 —— 以后再点空，一眼就能看出是不是在视口外 */
+          return JSON.stringify({x:cx, y:cy, rect:{x:Math.round(r.x),y:Math.round(r.y),
+            w:Math.round(r.width),h:Math.round(r.height)}, vw:vw, vh:vh,
+            in_view: cx>=0 && cy>=0 && cx<=vw && cy<=vh});
+        }
         e=e.parentElement;
       }
     }
     return '{}';
   })()`))
   if (!btn.x) { out({ ok: false, error: '找不到发布箭头', editor_html: editorHtml }); process.exit(1) }
+  if (btn.in_view === false) {
+    out({ ok: false, published: false, verified: false,
+      error: `发布按钮在视口外（x=${btn.x} y=${btn.y}，视口 ${btn.vw}x${btn.vh}）—— 滚动没生效，点了也点不到`,
+      btn, aweme_id: AWEME, mention: NAME, editor_html: editorHtml })
+    process.exit(1)
+  }
   await click(btn.x, btn.y)
   await sleep(4000)
 
   const editorAfter = await c.ev(`(function(){ var e=document.querySelector('.public-DraftEditor-content'); return e ? String(e.innerText||'').slice(0,60) : '(gone)'; })()`)
   c.close()
   await sleep(200)   // 等 WebSocket 真正关掉再退出（别的工具踩过 libuv 断言）
-  out({ ok: true, published: true, aweme_id: AWEME, mention: NAME, ...(replyInfo || {}), popup_row: row, editor_html: editorHtml, editor_after: editorAfter, chrome: chromed })
+  /**
+   * ⭐ 点了发布箭头不等于发出去了。
+   *    2026-10-25 实测：这里原来无条件 published:true，agent 就写「已在评论区 @ 你」，
+   *    但评论区翻了 125 条都找不到，使用者也没收到通知。
+   *    判据：发布成功后抖音会清空编辑器 —— 原文还在，就说明这条没提交上去。
+   */
+  const stillHasText = !!editorAfter && editorAfter !== '(gone)' && editorAfter.trim().length > 1
+  const verified = !stillHasText
+  out({
+    ok: verified,
+    published: verified,
+    verified,
+    aweme_id: AWEME,
+    mention: NAME,
+    ...(replyInfo || {}),
+    popup_row: row,
+    editor_html: editorHtml,
+    editor_after: editorAfter,
+    chrome: chromed,
+    ...(verified ? {} : { error: `点了发布箭头但编辑器里还留着「${editorAfter}」—— 这条没提交上去，别写「已 @」` }),
+  })
 } catch (e) {
   if (!(e && e.__done)) out({ ok: false, error: String(e?.message ?? e) })
 }

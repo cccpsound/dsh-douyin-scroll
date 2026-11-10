@@ -12,8 +12,10 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { findBrowser } from './lib/chrome.mjs'
+import { nodeRunner, whichInPath } from './lib/quiet.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 let pass = 0
@@ -68,7 +70,7 @@ console.log('\n4. JS 语法（node --check）')
 for (const f of ['index.js', 'client.js',
   ...readdirSync(join(here, 'lib')).filter((x) => x.endsWith('.mjs')).map((x) => join('lib', x)),
   ...readdirSync(join(here, 'tools')).filter((x) => x.endsWith('.mjs')).map((x) => join('tools', x))]) {
-  const r = spawnSync(process.execPath, ['--check', join(here, f)], { encoding: 'utf8' })
+  const r = spawnSync(nodeRunner(), ['--check', join(here, f)], { encoding: 'utf8' })
   if (r.status === 0) ok(f)
   else bad(`${f}：${(r.stderr || '').split('\n').slice(0, 3).join(' ')}`)
 }
@@ -208,19 +210,83 @@ try {
 
   // ⑤ index.js 双路径 + 命中条件
   const idx = readFileSync(join(here, 'index.js'), 'utf8')
+  // ⚠️ 2026-10-27：这里原来用 idx.indexOf('douyin_im_read')，但那个串第一次出现在
+  //    douyin_remember 的 description 里（"下次聊天时 douyin_im_read 会把这些一起返回"），
+  //    ⇒ 窗口从错的地方开始算，加完群聊分支后 if (toId) 落到 4000 字符窗口外，
+  //    这项就误报红了。改成锚定工具声明本身。
+  const imReadAt = idx.indexOf("name: 'douyin_im_read'")
+  const imReadWin = imReadAt >= 0 ? idx.slice(imReadAt, imReadAt + 4000) : ''
   if (/im-http\.py/.test(idx)) ok('douyin_im_read 先走 HTTP 快路径（im-http.py）')
   else bad('index.js 没接 im-http.py —— 快路径丢了')
-  if (/if \(toId\)/.test(idx.slice(idx.indexOf('douyin_im_read'), idx.indexOf('douyin_im_read') + 4000))) {
+  if (imReadAt < 0) bad('index.js 里找不到 douyin_im_read 工具声明')
+  if (/if \(toId\)/.test(imReadWin)) {
     ok('有 to_id（sec_uid）才走快路径 —— 不给 sec_uid 不白付 HTTP 往返')
   } else bad('快路径没有 to_id 前置条件 —— 读陌生人会白付一次往返')
   if (/http\.matched/.test(idx)) ok('命中只认 matched（反查核验通过的那个），不认别的')
   else bad('没有 matched 判定 —— 身份铁闸没接上')
-  if (/im-send\.mjs/.test(idx) && /陌生人/.test(idx.slice(idx.indexOf('douyin_im_read'), idx.indexOf('douyin_im_read') + 4000))) {
+  if (/im-send\.mjs/.test(idx) && /陌生人/.test(imReadWin)) {
     ok('读不到时退回浏览器路径（陌生人消息只有那条路能读）')
   } else bad('没有浏览器兜底 —— 陌生人的私信会读不到')
   if (/via:\s*'http'/.test(idx)) ok('返回里带 via 标明走的哪条路')
   else bad('没有 via 字段 —— 分不清这次读走的是哪条路')
   if (/im-http\.mjs/.test(idx)) bad('index.js 还在调 im-http.mjs —— 旧文件已删，这是死引用')
+
+  // ⑤-2 群聊只读（2026-10-27 新增）——防倒退断言
+  if (/--list-groups/.test(h) && /--conv-id/.test(h)) ok('im-http.py 有 --list-groups / --conv-id 两个群聊入口')
+  else bad('群聊入口没了 —— 读群聊只能靠这两个参数')
+  if (/if LIST_GROUPS:/.test(hCode) && /if CONV_ID_ARG:/.test(hCode)) ok('群聊分支在 --peer-sec-uid 之前先跑（不混进按人匹配）')
+  else bad('群聊分支没独立出来 —— 会把群 id 当人来匹配')
+  if (/c\["conv_id"\] == CONV_ID_ARG/.test(h)) ok('群聊按 conv_id 精确相等命中（不做身份推断）')
+  else bad('群聊没按 conv_id 精确匹配 —— 又回到猜')
+  if (/g1\(core, 50\)/.test(h) && /g1\(parse\(_g\), 5\)/.test(h)) ok('群名取自 core.f50.5（GroupInfo.name）')
+  else bad('没解群名 —— 列群时只能显示一串 conv_id')
+  if (/aweme_im_group_chat_notice/.test(h)) ok('认得出 aweme_im_group_chat_notice 服务端通知（不再一片[未知消息]）')
+  else bad('群通知没识别 —— 读群时噪音盖住真消息')
+  if (/aweType"\) or 0\) == 100140/.test(h)) ok('认得出 aweType=100140 群系统消息（模板代入）')
+  else bad('群系统消息没解析 —— 「XX邀请你加入了群聊」会变成[未知消息]')
+  if (/douyin_im_groups/.test(idx)) ok('有 douyin_im_groups 工具（列群，只读）')
+  else bad('没有列群工具 —— 拿不到 conv_id 就读不了群')
+  if (/group_id/.test(imReadWin)) ok('douyin_im_read 支持 group_id 参数')
+  else bad('douyin_im_read 不认 group_id —— 群聊读不到')
+  // ⚠️ 断言要落在**群聊分支内部**：整个 imReadWin 里当然有 im-send.mjs（私聊兜底要用），
+  //    所以只截 group_id 分支那一段看它调没调发送侧。
+  const groupBranchAt = imReadWin.indexOf('if (groupId)')
+  const groupBranch = groupBranchAt >= 0
+    ? imReadWin.slice(groupBranchAt, imReadWin.indexOf("const to = String", groupBranchAt) + 40)
+    : ''
+  if (groupBranchAt < 0) bad('找不到 group_id 分支')
+  else if (/runNodeTool\s*\(\s*['"]im-send\.mjs/.test(groupBranch)) bad('群聊被接到发送侧了 —— 读和发要分开')
+  else ok('群聊分支只调 im-http.py（没有 runNodeTool im-send.mjs，读群 ≠ 往群里发）')
+
+  /* ── 4b-3-⑥ 文案不许在这里被硬切（2026-11-08 加的防倒退） ──
+   *
+   * im-http.py 是整条链路的**起点**：卡片文案在这一步切短，下游
+   * （look-video / describeVideo / video-frames / persona-llm / xj_douyin）
+   * 无论把上限放宽到多少都补不回来。
+   *
+   * 2026-11-05 那次「四道截断统一到 2000」只改了 lib/ 和 xj_douyin/，漏了这里，
+   * 于是使用者又报了一次「文案正文还是没看全」。所以这条断言现在盯着它：
+   * 出现 `title` / `text` / `comment` 这类**文案字段**被 `[:N]` / `.slice(0, N)`
+   * 硬切到 400 以下的，直接报红。
+   *
+   * 不算数的：`sec_uid[:200]`（身份串）、`raw_keep[:900]`（调试用原始包）、
+   * `url[:500]`（签名链）、`_title[:120]`（作品标题，抖音本身就短）。
+   */
+  const HARD_CUT = /["'](?:title|text|comment|content_title|content_name|desc)["']\s*:\s*(?:str\([^)]*\)|[\w.]+)\s*\[\s*:\s*(\d+)\s*\]/g
+  const cutOffenders = []
+  let cm
+  while ((cm = HARD_CUT.exec(h)) !== null) {
+    const n = Number(cm[1])
+    if (n < 400) cutOffenders.push(`${cm[0]}（切到 ${n}）`)
+  }
+  if (cutOffenders.length) {
+    bad(`im-http.py 里又把文案硬切了：${cutOffenders.join('、')} —— 这里一切，下游放宽也补不回来，改用 fit_desc()`)
+  } else {
+    ok('im-http.py 的文案字段没有硬切（都走 fit_desc）')
+  }
+  if (/from desc_text import fit_desc/.test(h) || /def fit_desc\(/.test(h)) {
+    ok('im-http.py 有 fit_desc（含文件缺失时的兜底实现）')
+  } else bad('im-http.py 没有 fit_desc —— 文案收长规则丢了')
 } catch (e) { bad(`读不了 tools/im-http.py：${e.message}`) }
 
 /* ── 4c. 「先卡片，后文字」这条规矩不能被改回去 ── */
@@ -317,12 +383,32 @@ try {
     else bad('pre-push hook 存在但没拦住 —— 形同虚设')
   } else bad('没有 .githooks/pre-push —— 只在文档里写"不许推"，会忘')
   // hook 必须真的挂上（core.hooksPath 指对地方），否则文件在也不生效
-  try {
-    const r = spawnSync('git', ['config', 'core.hooksPath'], { cwd: here, encoding: 'utf8', timeout: 15_000 })
-    const hp = String(r.stdout || '').trim()
-    if (hp === '.githooks') ok('core.hooksPath 指向 .githooks（hook 真的生效）')
-    else bad(`core.hooksPath 是 "${hp}" 不是 .githooks —— hook 装了也不跑`)
-  } catch { warn('读不到 core.hooksPath（可能不是 git 仓库，或没装 git）') }
+  //
+  // ⚠️ 2026-10-25 改：不能只靠 spawnSync('git')。
+  //    这台机器上 git 不在 DSH 子进程的 PATH 里（`git` 直接 ENOENT），
+  //    于是检查永远是空串 —— 配置明明是对的，却报「装了也不跑」，属于**假失败**。
+  //    core.hooksPath 本来就是 .git/config 里的一个键，ini 格式直接读即可，
+  //    不依赖 git 二进制。两条路都走：先问 git（它会给合并后的最终值，更权威），
+  //    问不到再回落到读文件。
+  const hooksPath = (() => {
+    try {
+      const r = spawnSync('git', ['config', 'core.hooksPath'], { cwd: here, encoding: 'utf8', timeout: 15_000 })
+      const v = String(r?.stdout || '').trim()
+      if (v) return { value: v, from: 'git' }
+    } catch {
+      /* git 不在 PATH，往下走读文件 */
+    }
+    try {
+      const cfg = readFileSync(join(here, '.git', 'config'), 'utf8')
+      const m = /^\s*hooksPath\s*=\s*(.+)$/m.exec(cfg)
+      return { value: m ? m[1].trim() : '', from: '.git/config' }
+    } catch {
+      return { value: '', from: 'none' }
+    }
+  })()
+  if (hooksPath.value === '.githooks') ok(`core.hooksPath 指向 .githooks（hook 真的生效；来自 ${hooksPath.from}）`)
+  else if (hooksPath.from === 'none') warn('读不到 core.hooksPath（不是 git 仓库，或没装 git）')
+  else bad(`core.hooksPath 是 "${hooksPath.value}" 不是 .githooks —— hook 装了也不跑（来自 ${hooksPath.from}）`)
   // 文档里要写清版本号怎么用
   if (/不发版本|版本号只跟/.test(charter2) || /版本号只跟/.test(readFileSync(join(here, 'CHANGELOG.md'), 'utf8'))) {
     ok('文档写明了版本号怎么用（只跟"使用者能感觉到的变化"走）')
@@ -480,7 +566,7 @@ try {
       bad('mcp-server.mjs 正文里用了 console.log —— 会污染 JSON-RPC 的 stdout，客户端会崩')
     } else ok('mcp-server.mjs 正文不往 stdout 打日志（只走 stderr）')
     // ③ 真跑一遍协议握手
-    const st = spawnSync(process.execPath, [mcpFile, '--selftest'], {
+    const st = spawnSync(nodeRunner(), [mcpFile, '--selftest'], {
       encoding: 'utf8', timeout: 60_000,
       env: { ...process.env, PYTHONUTF8: '1' },
     })
@@ -564,7 +650,7 @@ try {
  */
 console.log('\n4j. 设置页渲染 + 新手流程')
 try {
-  const r = spawnSync(process.execPath, [join(here, 'tools', 'panel-render-check.mjs')], {
+  const r = spawnSync(nodeRunner(), [join(here, 'tools', 'panel-render-check.mjs')], {
     encoding: 'utf8', timeout: 120_000,
   })
   // ⭐ 2026-10-24 起检查脚本以 process.exit 收尾（组件里的轮询定时器会挂住进程）——
@@ -827,7 +913,7 @@ try {
     const mem = readFileSync(memFile, 'utf8')
     ok('lib/memory.mjs 在')
     // 真跑一遍记忆自测
-    const t = spawnSync(process.execPath, [join(here, 'tools', 'memory-test.mjs')], { encoding: 'utf8', timeout: 60_000 })
+    const t = spawnSync(nodeRunner(), [join(here, 'tools', 'memory-test.mjs')], { encoding: 'utf8', timeout: 60_000 })
     const m = String(t.stdout || '').match(/结果：(\d+) 通过 \/ (\d+) 失败/)
     if (t.status === 0 && m) ok(`记忆自测通过（${m[1]} 项：去重/上限/事实/评论/清空）`)
     else bad(`记忆自测失败：${String(t.stdout || t.stderr || '').split('\n').slice(-3).join(' ')}`)
@@ -1065,7 +1151,7 @@ try {
       '**星星之火，可以燎原** · @方面面 · 57.6 秒',
       '**一句话**：一张纸烧完露出底下的画。',
     ].join('\n')
-    const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+    const r = spawnSync(nodeRunner(), ['--input-type=module', '-e',
       `import { toastSummary } from ${JSON.stringify(new URL('./lib/toast.mjs', import.meta.url).href)};`
       + `const s = toastSummary(${JSON.stringify(sample)}, {day:'x'});`
       + `console.log(JSON.stringify({title:s.title,body:s.body,picked:s.picked}))`], { encoding: 'utf8', timeout: 30_000 })
@@ -1100,7 +1186,22 @@ try {
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */
 console.log('\n5. Python')
-const py = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
+// ⚠️ 2026-10-29：优先用 venv 里的 pythonw.exe（GUI 子系统，Subsystem=2）。
+// 裸 'python' 在 PATH 上是 Console 子系统（Subsystem=3），一旦父进程没有控制台
+// （wscript / pythonw 拉起时），Windows 11 会交给 Windows Terminal 新建一个可见
+// 控制台窗口 —— 全屏游戏会被强行弹出。pythonw 压根不申请控制台，管道照常读写。
+const py = (() => {
+  if (process.env.PYTHON) return process.env.PYTHON
+  if (process.platform !== 'win32') return 'python3'
+  const home = process.env.DOUYIN_HOME || process.env.DOUYIN_DUTY_HOME
+    || join(homedir(), '.dsh', 'douyin-duty')
+  const cands = [
+    join(home, '.venv', 'Scripts', 'pythonw.exe'),
+    'E:\\_bot\\astrbot\\venv\\Scripts\\pythonw.exe',
+  ]
+  for (const p of cands) { try { if (existsSync(p)) return p } catch { /* 下一个 */ } }
+  return 'python'
+})()
 const ver = spawnSync(py, ['--version'], { encoding: 'utf8' })
 if (ver.status === 0) {
   ok(`${py} → ${(ver.stdout || ver.stderr || '').trim()}`)
@@ -1162,8 +1263,11 @@ const found = findBrowser()
 if (found) ok(`浏览器已找到：${found}（无头发私信 / 卡片 / 评论要用它）`)
 else warn('没找到 Chrome / Edge / Chromium —— 发私信 / 卡片 / 评论会失败；'
   + '装一个，或把完整路径写进环境变量 DOUYIN_BROWSER')
-const dsh = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['dsh'], { encoding: 'utf8' })
-if (dsh.status === 0) ok('dsh 在 PATH 里')
+// ⚠️ 2026-10-29：不能用 spawnSync('where') —— where.exe 是 Console 子系统，
+// 无控制台的父进程（wscript / pythonw）下它会拉起一个可见的 Windows Terminal 窗口。
+// 查 PATH 在 JS 里做就行，没必要起进程。
+const dshPath = whichInPath('dsh')
+if (dshPath) ok(`dsh 在 PATH 里：${dshPath}`)
 else warn('dsh 不在 PATH —— 桌面版正常（插件会自动去应用目录找）；npm 装的请确认 PATH')
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

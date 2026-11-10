@@ -33,6 +33,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
+import { nodeRunner } from '../lib/quiet.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -60,7 +61,7 @@ const pyEnv = (extra = {}) => ({
 })
 
 const venvPython = () => process.platform === 'win32'
-  ? join(HOME, '.venv', 'Scripts', 'python.exe')
+  ? join(HOME, '.venv', 'Scripts', 'pythonw.exe')
   : join(HOME, '.venv', 'bin', 'python')
 
 const hasVenv = () => existsSync(venvPython())
@@ -82,7 +83,7 @@ const run = (cmd, args, timeout = 240_000) => {
   }
 }
 
-const runNode = (script, args = [], timeout = 240_000) => run(process.execPath, [join(ROOT, 'tools', script), ...args], timeout)
+const runNode = (script, args = [], timeout = 240_000) => run(nodeRunner(), [join(ROOT, 'tools', script), ...args], timeout)
 const runPy = (script, args = [], timeout = 240_000) => run(PY(), [join(ROOT, 'tools', script), ...args], timeout)
 
 const readJson = (file, fallback = null) => {
@@ -454,6 +455,19 @@ const TOOLS = [
       if (j.ok && j.placement && j.placement.ok === false) {
         j.warning = j.placement.warn
       }
+      /**
+       * ⭐ 审核状态（2026-10-25 加）：ok:true 只代表服务端收下了，不代表别人看得见。
+       *   抖音新评论先进审核队列（status=7/2），审核中的不出现在评论区列表里。
+       *   不在这儿说清楚，agent 就会照着 ok:true 写「已经发在评论区 @ 你了」，
+       *   而使用者去看评论时一条都找不到 —— 这就是之前那个假成功的来源。
+       */
+      if (j.ok && j.cid && j.publish_state && j.publish_state !== 'published') {
+        j.warning = [j.warning, j.pending_hint || (
+          `评论已提交（cid=${j.cid}）但状态是 ${j.publish_state}`
+          + `（readback_status=${j.readback_status ?? '未知'}）—— 还在审核，别人现在刷不到。`
+          + '过几分钟用 douyin_comment_verify 再查一次。**别跟使用者说「已经发在评论区了」。**'
+        )].filter(Boolean).join(' / ')
+      }
       return j
     },
   },
@@ -582,7 +596,84 @@ const TOOLS = [
       const r = runNode('comment-mention-ui.mjs', argv, 300_000)
       const j = pickJson(r.stdout)
       if (!j) return { ok: false, error: '真 @ 执行器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) }
+      /**
+       * ⭐ published:false 的真实含义（2026-10-25 查清）：
+       *   判据是「编辑器有没有被清空」。没清空 = 提交没成功。
+       *   实测最常见的原因是抖音风控要求二次验证（人脸/短信）——
+       *   页面会去打 /passport/safe/query_decision/（verify_scene=comment），
+       *   这不是脚本 bug，换任何前端操作都过不去，只能使用者本人在有头浏览器里解一次。
+       */
+      if (j.ok === false || j.published === false || j.verified === false) {
+        j.blocked_likely = 'risk_verify'
+        j.hint = '没提交上去。最常见原因是抖音风控要求评论前做一次人验证'
+          + '（人脸/短信，页面会请求 /passport/safe/query_decision/）。'
+          + '**这不是换个参数能绕过去的**：请使用者本人在有头 Chrome 里手动发一条评论、把验证点掉，'
+          + '之后再跑这里通常就通了。'
+        j.editor_after = j.editor_after || '(未返回)'
+      }
       return j
+    },
+  },
+  /* ── ⭐ 评论状态（按 cid 精确回读） ── */
+  {
+    name: 'douyin_comment_verify',
+    title: '刷抖音 · 验评论是否放出',
+    description: '按 comment_id 精确回读评论，告诉你它到底是**已放出**还是**还在审核**。'
+      + '⭐ 发完评论必查：抖音新评论先进审核队列（status=7/2），审核中的**不出现在普通评论区列表里**，'
+      + '自动化脚本很容易误判成「没发出去」。这个工具用 insert_ids 定向取，审核中也能读到。'
+      + '只读。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        aweme_id: { type: 'string', description: '作品/图文 id（19 位）' },
+        cids: { type: 'string', description: '要查的 comment_id，多个用逗号分隔（最多 20 个）' },
+      },
+      required: ['aweme_id', 'cids'],
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      try {
+        const bad = needLogin() || needSetup()
+        if (bad) return bad
+        const aweme = String(args?.aweme_id || '').trim()
+        const cids = String(args?.cids || '').trim()
+        if (!aweme) return { ok: false, error: '缺 aweme_id' }
+        if (!cids) return { ok: false, error: '缺 cids（要查的评论 id，逗号分隔）' }
+        const r = runNode('comment-read-page.mjs', ['--aweme', aweme, '--ids', cids], 180_000)
+        const j = pickJson(r.stdout)
+        if (!j) return { ok: false, error: '读取器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) }
+        const list = (j.comments || []).map((x) => ({
+          cid: x.cid, text: x.text, nick: x.nick, uid: x.uid, level: x.level,
+          /**
+           * 实测校正（2026-10-25）：只有 status=1 是「评论区列表里真的能看到」。
+           *   status=3 和 7 都能按 cid 读到，但普通 /comment/list/ 里没有 —— 刷不到。
+           * ⇒ 用白名单，别用黑名单（!=7 会把 3 误判成已放出）。
+           */
+          status: x.status,
+          state: Number(x.status) === 1 ? 'published' : 'pending',
+        }))
+        const pending = list.filter((x) => x.state === 'pending').length
+        return {
+          ok: true,
+          aweme_id: aweme,
+          requested: cids.split(',').map((s) => s.trim()).filter(Boolean),
+          found_n: list.length,
+          pending_n: pending,
+          comments: list,
+          ...(pending
+            ? {
+              warning: `其中 ${pending} 条状态不是 1（实测 status 里只有 1 是「评论区真的能看到」）——`
+                + '接口能按 cid 读到，但别人刷评论区刷不到。'
+                + '这不是失败，是抖音还没放出来；过一阵再查。**别跟人说「已经发在评论区了」。**',
+            }
+            : {}),
+          ...(list.length === 0
+            ? { note: '一条都没读到：可能 cid 给错了，或这条已经被删了。' }
+            : {}),
+        }
+      } catch (e) {
+        return { ok: false, error: String(e?.message ?? e) }
+      }
     },
   },
   {

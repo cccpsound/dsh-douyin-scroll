@@ -19,7 +19,7 @@ import { sendToast } from '../lib/toast.mjs'
 import { homeDir } from '../lib/paths.mjs'
 
 const HOME = homeDir()
-const VENV_PY = join(HOME, '.venv', 'Scripts', 'python.exe')
+const VENV_PY = join(HOME, '.venv', 'Scripts', 'pythonw.exe')
 const SCRIPT = new URL('./forward-pick.py', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
 
 const argv = process.argv.slice(2)

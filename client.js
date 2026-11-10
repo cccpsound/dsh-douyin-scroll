@@ -23,7 +23,7 @@ window.__ModuleLoader__.load({
      *    面板看起来"没变化"，很难判断是代码错了还是没加载。
      *    对一下面板右上角显示的 `v<版本>·b<N>` 就知道。
      */
-    const PANEL_BUILD = 17
+    const PANEL_BUILD = 19
 
     const asJson = async (res) => {
       if (res.ok) return res.json()
@@ -820,6 +820,100 @@ window.__ModuleLoader__.load({
           /* ⭐ 实时状态屏（2026-10-24 使用者要求：「我哪知道它有什么用、错在哪了」）：
            *    开着聊天模式时每 15 秒拉一次后端状态，显示几秒前看过、结果、通知弹没弹。 */
           cfg.chatWatch ? h(ChatWatchStatus, { key: 'cw-status' }) : null),
+
+          /* ⭐⭐ 自动回「别人 @ 我」（2026-10-25 使用者要求：「让她自己能自动回复别人的艾特」）
+           *   与上面聊天模式的区别：那个只**看**私信并提醒，这个会**真的在评论区回话**。
+           *   默认关 —— 这是拿使用者账号对外说话，得他亲手打开。 */
+          h('div', { 'data-dy-row': '', style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.08))' } },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '自动回 @'),
+              h('div', { 'data-dy-sub': '' },
+                (cfg.atWatch
+                  ? `✅ 开着：每 ${Math.max(30, Math.min(Number(cfg.atWatchSec || 120), 3600))} 秒看一次通知，有人 @ 她就在那条评论下回复（每轮最多 ${Math.max(1, Math.min(Number(cfg.atWatchMax || 3), 20))} 条）。范围：${cfg.atWatchAweme ? `只盯视频 ${cfg.atWatchAweme}` : '全站（哪条视频下的 @ 都算）'}。`
+                  : '关着（默认）。打开后她会自己盯通知，有人 @ 就在评论区直接回复 —— 用的是你的账号在对外说话，所以默认不替你开。'))),
+            h(Switch, {
+              on: Boolean(cfg.atWatch),
+              disabled: busy === 'patch',
+              onChange: (v) => patch({ atWatch: v }, v
+                ? '✅ 已打开自动回 @（她在评论区替你回话）'
+                : '已关闭自动回 @'),
+            })),
+          cfg.atWatch
+            ? h('div', { 'data-dy-row': '' },
+              h('span', { 'data-dy-sub': '' }, '扫通知的间隔（秒，30–3600）'),
+              h('input', {
+                'data-dy-input': '', style: { width: '90px' }, type: 'number', min: 30, max: 3600,
+                value: String(cfg.atWatchSec || 120),
+                onChange: (e) => {
+                  const n = Math.max(30, Math.min(Number(e.target.value) || 120, 3600))
+                  patch({ atWatchSec: n }, `自动回 @ 间隔已存：${n} 秒`)
+                },
+              }),
+              h('span', { 'data-dy-sub': '', style: { marginLeft: '10px' } }, '每轮最多回'),
+              h('input', {
+                'data-dy-input': '', style: { width: '60px' }, type: 'number', min: 1, max: 20,
+                value: String(cfg.atWatchMax || 3),
+                onChange: (e) => {
+                  const n = Math.max(1, Math.min(Number(e.target.value) || 3, 20))
+                  patch({ atWatchMax: n }, `自动回 @ 上限已存：${n} 条/轮`)
+                },
+              }),
+              h('span', { 'data-dy-sub': '' }, '条'))
+            : null,
+
+          /* ⭐⭐ 自动回「私信」（2026-10-25 使用者原话：「私聊已读不回呢」）
+           *   与上面两层的区别：
+           *     · 聊天模式 = 只看私信、记状态，不回
+           *     · 自动回 @ = 盯评论区，在评论下回
+           *     · 这一层   = 盯私信，直接用私信回
+           *   同样默认关 —— 拿使用者账号对外说话，得他亲手打开。 */
+          h('div', { 'data-dy-row': '', style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.08))' } },
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-title': '' }, '自动回私信'),
+              h('div', { 'data-dy-sub': '' },
+                (cfg.dmAuto
+                  ? `✅ 开着：每 ${Math.max(30, Math.min(Number(cfg.dmAutoSec || 90), 3600))} 秒扫一遍${String(cfg.dmScope || 'all') === 'one' ? `「${cfg.dmTo || '私信对象'}」` : '**所有私聊会话**'}，有新消息就自己回（每天最多 ${Number(cfg.dmAutoMax) === 0 ? '不限' : Math.max(1, Math.min(Number(cfg.dmAutoMax || 5), 20))} 条，${cfg.dmAutoQuiet || '无静默'} 不回）。`
+                  : '关着（默认）。打开后她收到私信会自己回一句 —— 用的是你的账号在对外说话，所以默认不替你开。'))),
+            h(Switch, {
+              on: Boolean(cfg.dmAuto),
+              disabled: busy === 'patch',
+              onChange: (v) => patch({ dmAuto: v }, v
+                ? '✅ 已打开自动回私信（她会在私信里替你回话）'
+                : '已关闭自动回私信'),
+            })),
+          cfg.dmAuto
+            ? h('div', { 'data-dy-row': '' },
+              h('span', { 'data-dy-sub': '' }, '查私信的间隔（秒，30–3600）'),
+              h('input', {
+                'data-dy-input': '', style: { width: '90px' }, type: 'number', min: 30, max: 3600,
+                value: String(cfg.dmAutoSec || 90),
+                onChange: (e) => {
+                  const n = Math.max(30, Math.min(Number(e.target.value) || 90, 3600))
+                  patch({ dmAutoSec: n }, `自动回私信间隔已存：${n} 秒`)
+                },
+              }),
+              h('span', { 'data-dy-sub': '', style: { marginLeft: '10px' } }, '每天最多回'),
+              h('input', {
+                'data-dy-input': '', style: { width: '60px' }, type: 'number', min: 1, max: 20,
+                value: String(cfg.dmAutoMax || 5),
+                onChange: (e) => {
+                  const n = Math.max(1, Math.min(Number(e.target.value) || 5, 20))
+                  patch({ dmAutoMax: n }, `自动回私信上限已存：${n} 条/天`)
+                },
+              }),
+              h('span', { 'data-dy-sub': '' }, '条'),
+              h('span', { 'data-dy-sub': '', style: { marginLeft: '10px' } }, '静默时段'),
+              h('input', {
+                'data-dy-input': '', style: { width: '110px' }, type: 'text',
+                value: String(cfg.dmAutoQuiet || ''),
+                placeholder: '01:00-08:00',
+                onChange: (e) => {
+                  const v = String(e.target.value || '').trim()
+                  patch({ dmAutoQuiet: /^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(v) || !v ? v : String(cfg.dmAutoQuiet || ''), },
+                    /^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(v) || !v ? `静默时段已存：${v || '无'}` : '格式要像 01:00-08:00')
+                },
+              }))
+            : null,
 
         /* ── 桌面小宠已搬去独立插件 dsh-deskpet（2026-10-24）：
          *    开关/人格/弹幕/走动/喂饭/维修工全在 设置 → dsh-deskpet 那页。这里不再放她的卡片。 ── */

@@ -14,21 +14,22 @@ tools/api-reply.py —— 走**一条接口**回评论（不用点开评论区�
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, node_bin  # noqa: E402
 import time
 import urllib.parse
 
 import httpx
 
 HOME = home_str()
-PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
-NODE = r"C:\Program Files\nodejs\node.exe"
+PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
-VENVPY = os.path.join(HOME, ".venv", "Scripts", "python.exe")
+VENVPY = os.path.join(HOME, ".venv", "Scripts", "pythonw.exe")
 GUARD = os.path.join(PLUGIN, "tools", "session-guard.py")
 COOKIE = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
 

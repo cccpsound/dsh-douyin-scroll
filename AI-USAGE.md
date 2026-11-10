@@ -72,7 +72,22 @@ node "<插件目录>/tools/mcp-server.mjs"
 | `douyin_comments` | 读一个视频的评论（含楼中楼） | 判断「这视频好不好玩」 |
 | `douyin_notices` | 谁 @ 了你 / **谁回复了你的评论** / 谁评论点赞关注（每条带 `comment_id` + `root_comment_id`） | 回消息前先看 |
 | `douyin_at_me` | ⭐ **谁在跟我说话** —— @ 我 + **回复了我的评论**（带"回过没有"+ 我在这条视频下说过什么 + 楼根） | 回评论前调它 |
-| `douyin_im_read` | 读私信会话（带 from: me/them） | 看对方最近说了什么 |
+| `douyin_im_read` | 读私信会话（带 from: me/them）；传 `group_id` 改读**群聊** | 看对方最近说了什么 |
+| `douyin_im_groups` | 列出我建立的**抖音群聊**（群名 + conv_id + 最后一条） | 要读群聊时先调它拿 conv_id |
+
+### 读群聊（只读，**不按人匹配**）
+
+```
+douyin_im_groups  →  { groups: [{ conv_id, name, message_count, last_text }] }
+douyin_im_read { group_id: "<conv_id>" }
+```
+
+群聊的 `peer_uid` 是**群 id**，不在人的 sec_uid/uid 体系里 —— 所以群聊**不走**
+「按人反查 → uid 严格相等」那条身份铁闸，而是**只按 conv_id 直读**。
+给错 id 直接报错并列出已知会话，不按昵称/序号猜群。
+
+⚠️ 群聊**只读**：`im-send.mjs` 只支持私聊，别把 `group_id` 拿去发消息。
+⚠️ 只覆盖「已建立会话」（在消息列表里出现过的群）；没聊过、没被拉进去的群不在这里。
 
 ### 会发东西（**必须 `confirm: true`**）
 
